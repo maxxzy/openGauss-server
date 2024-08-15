@@ -38,7 +38,8 @@ static const unsigned __int64 epoch = UINT64CONST(116444736000000000);
  *
  * Note: this function is not for Win32 high precision timing purpose. See elapsed_time().
  */
-int gettimeofday(struct timeval* tp, struct timezone* tzp)
+
+int gettimeofday_new(struct timeval* tp, struct timezone* tzp)
 {
     FILETIME file_time;
     SYSTEMTIME system_time;
