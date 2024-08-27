@@ -2709,6 +2709,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          * buffer pool, and check to see if the correct data has been loaded
          * into the buffer.
          */
+        HitBuffer(buf_id);
         buf = GetBufferDescriptor(buf_id);
 
         valid = PinBuffer(buf, strategy);
@@ -3061,6 +3062,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         *found = TRUE;
     }
 
+    BufferAdmit(buf);
     return buf;
 }
 

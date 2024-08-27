@@ -29,6 +29,8 @@
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/storage_gstrace.h"
 #include "pgstat.h"
+#include <unordered_map>
+#include <list>
 
 #define INT_ACCESS_ONCE(var) ((int)(*((volatile int *)&(var))))
 
@@ -58,6 +60,30 @@ typedef struct BufferStrategyControl {
      * StrategyNotifyBgWriter.
      */
     int bgwprocno;
+
+    std::list<int> cold_list;
+    int cold_size;
+    std::unordered_map<int, std::list<int>::iterator> cold_map;
+    slock_t cold_list_lock;
+
+    std::list<BufferTag> history_list;
+    int history_size;
+    std::unordered_map<BufferTag, std::list<BufferTag>::iterator> history_map;
+    std::unordered_map<BufferTag, int> history_hitcount_map;//buf被淘汰后会用于新buf,buf_tag对应的hitcount需要在history_list中维护
+    slock_t history_list_lock;
+
+    std::list<int> hot_list;
+    int hot_size;
+    std::unordered_map<int, std::list<int>::iterator> hot_map;
+    slock_t hot_list_lock;
+
+    uint32 bottom;
+    uint32 level_num;
+    uint32 history_capacity;
+    uint32 capacity;
+
+    bool in_compaction;
+    slock_t compaction_lock;
 } BufferStrategyControl;
 
 typedef struct {
@@ -69,6 +95,13 @@ const int MIN_DELAY_RETRY = 100;
 const int MAX_DELAY_RETRY = 1000;
 const int MAX_RETRY_TIMES = 1000;
 const float NEED_DELAY_RETRY_GET_BUF = 0.8;
+
+enum NodeType : uint8_t {
+    NONE = 1,
+    A1_IN_TYPE = 2,
+    A1_OUT_TYPE = 3,
+    AM_TYPE = 4
+};
 
 /* Prototypes for internal functions */
 static BufferDesc* GetBufferFromRing(BufferAccessStrategy strategy, uint32* buf_state);
@@ -157,6 +190,358 @@ static inline uint32 ClockSweepTick(int max_nbuffer_can_use)
         }
     }
     return victim;
+}
+
+/**
+ * @description:hotlist中buf小于bottom降级至coldlist,未出现降级则提高bottom重试
+ * @return {*}
+ * @use:
+ * @author: xzy
+ */
+void compaction() {
+    BufferDesc *buf = NULL;
+    uint32 local_buf_state = 0;
+    bool if_demote = false;
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    auto bottom = Controller->bottom;
+retry:
+    auto iter = Controller->hot_list.begin();
+    while(++iter != Controller->hot_list.end()) {
+        int buf_id = *iter;
+        buf = GetBufferDescriptor(buf_id);
+        local_buf_state = LockBufHdr(buf);
+        if (buf->hitcount <= bottom) {
+            SpinLockAcquire(&Controller->hot_list_lock);
+            Controller->hot_size--;
+            Controller->hot_list.erase(iter);
+            Controller->hot_map.erase(buf_id);
+            SpinLockRelease(&Controller->hot_list_lock);
+
+            SpinLockAcquire(&Controller->cold_list_lock);
+            Controller->cold_size++;
+            Controller->cold_list.emplace_back(buf_id);
+            Controller->cold_map.emplace(buf_id, Controller->cold_list.end() - 1);
+            SpinLockRelease(Controller->cold_list_lock);
+            buf->buftype = NodeType::A1_IN_TYPE;
+            buf->hitcount = 1;
+            if_demote = true;
+        }
+        UnlockBufHdr(buf, local_buf_state);
+    }
+    if (!if_demote) {
+        bottom = (bottom + 1) % Controller->level_num;
+        goto retry;
+    }
+    Controller->in_compaction = false;
+}
+
+bool check_compaction() {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    if (Controller->in_compaction) {
+        return true;
+    }
+    if (Controller->cold_size + Controller->hot_size >= Controller->capacity) {
+        Controller->in_compaction = true;
+        compaction();
+        return false;
+    }
+}
+
+/**
+ * @description: 检查historylist长度,超过上限则删除记录(fifo)
+ * @return {*}
+ * @use:
+ * @author: xzy
+ */
+void CheckHistoryListSize() {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    while (Controller->history_size > Controller->history_capacity){
+        Controller->history_map.erase(Controller->history_list.front());
+        Controller->history_hitcount_map.erase(Controller->history_list.front());
+        Controller->history_list.pop_front();
+        Controller->history_size--;
+    }
+}
+
+/**
+ * @description:当buf在缓冲区中(在coldlist或hotlist中)执行该函数
+ * 1.buf位于coldlist,若需要或正在compaction则只hitcount++,否则从coldlist中移入hotlist
+ * 2.buf位于hotlist修改hitcount
+ * @param {int} buf_id
+ * @return {*}
+ * @use:bufmgr.cpp:2712
+ * @author: xzy
+ */
+void HitBuffer(int buf_id){
+    BufferDesc *buf = NULL;
+    BufferStrategyControl* Controller = t_thrd.storage_cxt.StrategyControl;
+
+    uint32 local_buf_state = 0;
+    buf = GetBufferDescriptor(buf_id);
+
+    local_buf_state = LockBufHdr(buf);
+
+    if (buf->buftype == NodeType::A1_IN_TYPE) {
+        if (Controller->cold_map.find(buf_id) == Controller->cold_map.end()) {
+            UnlockBufHdr(buf, local_buf_state);
+            ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("buffer is not in coldlist"))));
+        }
+        if (check_compaction()) {
+            buf->hitcount++;
+        } else {
+            auto list_iter = Controller->cold_map.at(buf_id);
+            SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+            Controller->cold_size--;
+            Controller->cold_list.erase(list_iter);
+            Controller->cold_map.erase(buf_id);
+            SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+
+            SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+            Controller->hot_size++;
+            Controller->hot_list.emplace_back(buf_id);
+            Controller->hot_map.emplace(buf_id, Controller->hot_list.end() - 1);
+            SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+
+            buf->buftype = NodeType::AM_TYPE;
+            buf->hitcount = (Controller->bottom + buf->hitcount - 1) % Controller->level_num;
+        }
+        UnlockBufHdr(buf, local_buf_state);
+        return;
+    } else if (buf->buftype == NodeType::AM_TYPE) {
+        auto top = (Controller->bottom - 1) % Controller->level_num;
+        if (buf->hitcount != top) {
+            buf->hitcount++;
+            if (buf->hitcount >= Controller->level_num) {
+                buf->hitcount -= Controller->level_num;
+            }
+        }
+        UnlockBufHdr(buf, local_buf_state);
+        return;
+    } else {
+        UnlockBufHdr(buf, local_buf_state);
+        ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("buffertype is wrong"))));
+    }
+
+    UnlockBufHdr(buf, local_buf_state);
+}
+
+/**
+ * @description:新的buf加入缓冲区(coldlist和hotlist)
+ * 先判断是否在hitorylist中,若不在则加入coldlist
+ * 若buf_tag在historylist中,则加入hotlist,将historylist中维护的hitcount+1并交给当前buf,在historylist中移除buf_tag
+ * 执行BufferAdmit时buf应该已经是锁住的状态了
+ * @param {BufferDesc} *buf
+ * @return {*}
+ * @use: bufmgr.cpp:3065
+ * @author: xzy
+ */
+void BufferAdmit(BufferDesc *buf) {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    if (!Controller->history_map.find(buf->tag)) {
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        Controller->cold_size++;
+        Controller->cold_list.emplace_back(buf->buf_id);
+        buf->buftype = NodeType::A1_IN_TYPE;
+        Controller->cold_map.emplace(buf->buf_id, Controller->cold_list.end() - 1);
+        SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        return;
+    }
+
+    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list);
+    auto list_iter = Controller->history_map.at(buf->tag);
+    Controller->history_size--;
+    Controller->history_list.erase(list_iter);
+    Controller->history_map.erase(buf->buf_id);
+    int history_hitcount = Controller->history_hitcount_map.at(buf->tag) + 1;
+    SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
+
+    if (check_compation()) {
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list);
+        Controller->cold_size++;
+        Controller->cold_list.emplace(buf->buf_id);
+        Controller->cold_map.emplace(buf->buf_id, Controller->cold_list.end() - 1);
+        SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        buf->buftype = NodeType::A1_IN_TYPE;
+        buf->hitcount = history_hitcount;
+        return;
+    }
+
+    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock) ;
+    Controller->hot_size++;
+    Controller->hot_list.emplace_back(buf->buf_id);
+    Controller->hot_map.emplace(buf->buf_id, Controller->hot_list.end() - 1);
+    SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+    buf->buftype = NodeType::AM_TYPE;
+    buf->hitcount = (Controller->bottom + history_hitcount - 1) % Controller->level_num;
+}
+
+/**
+ * @description:从coldlist中淘汰(fifo),如果当前buf已被pin住或不合适会考虑coldlist中其他buf
+ * 找到合适的buf后从coldlist中移入historylist,historylist维护buftag和hitcount
+ * buf的hitcount置0,当前置换出去的buf会被新的覆盖
+ * @param {BufferAccessStrategy} strategy
+ * @param {uint32*} buf_state
+ * @return {BufferDesc*}
+ * @author: xzy
+ */
+BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_state)
+{
+    BufferDesc *buf = NULL;
+    int bgwproc_no;
+    int try_counter;
+    uint32 local_buf_state = 0; /* to avoid repeated (de-)referencing */
+    int max_buffer_can_use;
+    bool am_standby = RecoveryInProgress();
+    StrategyDelayStatus retry_lock_status = { 0, 0 };
+    StrategyDelayStatus retry_buf_status = { 0, 0 };
+
+    /*
+     * If given a strategy object, see whether it can select a buffer. We
+     * assume strategy objects don't need buffer_strategy_lock.
+     */
+    if (strategy != NULL) {
+        buf = GetBufferFromRing(strategy, buf_state);
+        if (buf != NULL) {
+            return buf;
+        }
+    }
+
+    /*
+     * If asked, we need to waken the bgwriter. Since we don't want to rely on
+     * a spinlock for this we force a read from shared memory once, and then
+     * set the latch based on that value. We need to go through that length
+     * because otherwise bgprocno might be reset while/after we check because
+     * the compiler might just reread from memory.
+     *
+     * This can possibly set the latch of the wrong process if the bgwriter
+     * dies in the wrong moment. But since PGPROC->procLatch is never
+     * deallocated the worst consequence of that is that we set the latch of
+     * some arbitrary process.
+     */
+    bgwproc_no = INT_ACCESS_ONCE(t_thrd.storage_cxt.StrategyControl->bgwprocno);
+    if (bgwproc_no != -1) {
+        /* reset bgwprocno first, before setting the latch */
+        t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
+
+        /*
+         * Not acquiring ProcArrayLock here which is slightly icky. It's
+         * actually fine because procLatch isn't ever freed, so we just can
+         * potentially set the wrong process' (or no process') latch.
+         */
+        SetLatch(&g_instance.proc_base_all_procs[bgwproc_no]->procLatch);
+    }
+
+    /*
+     * We count buffer allocation requests so that the bgwriter can estimate
+     * the rate of buffer consumption.	Note that buffers recycled by a
+     * strategy object are intentionally not counted here.
+     */
+    (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
+
+    /* Check the Candidate list */
+    if (ENABLE_INCRE_CKPT && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 1) {
+        if (NEED_CONSIDER_USECOUNT) {
+            const uint32 MAX_RETRY_SCAN_CANDIDATE_LISTS = 5;
+            const int MILLISECOND_TO_MICROSECOND = 1000;
+            uint64 maxSleep = u_sess->attr.attr_storage.BgWriterDelay * MILLISECOND_TO_MICROSECOND;
+            uint64 sleepTime = 1000L;
+            uint32 retry_times = 0;
+            while (retry_times < MAX_RETRY_SCAN_CANDIDATE_LISTS) {
+                buf = get_buf_from_candidate_list(strategy, buf_state);
+                if (buf != NULL) {
+                    (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
+                    return buf;
+                }
+                pg_usleep(sleepTime);
+                sleepTime = Min(sleepTime * 2, maxSleep);
+                retry_times++;
+            }
+        } else {
+            buf = get_buf_from_candidate_list(strategy, buf_state);
+            if (buf != NULL) {
+                (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
+                return buf;
+            }
+        }
+    }
+
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    auto iter = Controller->cold_list.begin() + 1;
+    try_counter = Controller->cold_size;
+retry:
+    int buf_id = *iter;
+    buf = GetBufferDescriptor(buf_id);
+
+    if (!retryLockBufHdr(buf, &local_buf_state)) {
+            if (++iter == Controller->cold_list.end()) {
+                ereport(WARNING,
+                        (errmsg("try get buf headr lock times equal to cold_size when StrategyGetBuffer")));
+                iter = Controller->cold_list.begin() + 1;
+            }
+            perform_delay(&retry_lock_status);
+            goto retry;
+    }
+
+    if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
+        (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
+
+        if (strategy != NULL) {
+            AddBufferToRing(strategy, buf);
+        }
+
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        Controller->cold_list.erase(iter);
+        Controller->cold_map.erase(*iter);
+        Controller->cold_size--;
+        buf->buftype = NodeType::NONE;
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
+        Controller->history_list.emplace_back(buf->tag);
+        Controller->history_size++;
+        Controller->history_map.emplace(buf->tag, Controller->history_list.end() - 1);
+        Controller->history_hitcount_map.emplace(buf->tag, buf->hitcount);
+        buf->hitcount = 0;
+        CheckHistoryListSize();
+        SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
+
+        *buf_state = local_buf_state;
+        return buf;
+    } else if (--try_counter == 0) {
+        UnlockBufHdr(buf, local_buf_state);
+        ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("no unpinned buffers available"))));
+    }
+    UnlockBufHdr(buf, local_buf_state);
+    goto retry;
+
+    return NULL;
+
+/*
+retry:
+    int try_get_loc_times = 10;
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    int buf_id = Controller->cold_list.front();
+    Controller->cold_list.pop_front();
+    Controller->cold_size--;
+    Controller->cold_map.erase(buf_id);
+
+    buf = GetBufferDescriptor(buf_id);
+    local_buf_state = LockBufHdr(buf);
+
+    if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
+            (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
+            if (strategy != NULL)
+                AddBufferToRing(strategy, buf);
+            *buf_state = local_buf_state;
+            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
+            return buf;
+    } else {
+        UnlockBufHdr(buf, local_buf_state);
+        ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("no unpinned buffers available"))));
+    }
+    UnlockBufHdr(buf, local_buf_state);
+    return NULL;
+  */
 }
 
 /*

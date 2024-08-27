@@ -25,6 +25,7 @@
 #include "utils/relcache.h"
 #include "utils/atomic.h"
 #include "access/xlogdefs.h"
+#include <list>
 
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
@@ -217,6 +218,10 @@ typedef struct BufferDesc {
 
     LWLock* io_in_progress_lock; /* to wait for I/O to complete */
     LWLock* content_lock;        /* to lock access to buffer contents */
+
+    uint32 buftype;
+
+    uint32 hitcount;
 
     BufferDescExtra *extra;
 
