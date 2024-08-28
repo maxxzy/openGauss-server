@@ -63,7 +63,7 @@ typedef struct BufferStrategyControl {
 
     std::list<int> cold_list;
     int cold_size;
-    std::unordered_map<int, std::list<int>::iterator> cold_map;
+    //std::unordered_map<int, std::list<int>::iterator> cold_map;
     slock_t cold_list_lock;
 
     std::list<BufferTag> history_list;
@@ -74,7 +74,7 @@ typedef struct BufferStrategyControl {
 
     std::list<int> hot_list;
     int hot_size;
-    std::unordered_map<int, std::list<int>::iterator> hot_map;
+    //std::unordered_map<int, std::list<int>::iterator> hot_map;
     slock_t hot_list_lock;
 
     uint32 bottom;
@@ -210,18 +210,18 @@ retry:
         int buf_id = *iter;
         buf = GetBufferDescriptor(buf_id);
         local_buf_state = LockBufHdr(buf);
-        if (buf->hitcount <= bottom) {
+        if (buf->hitcount == bottom) {
             SpinLockAcquire(&Controller->hot_list_lock);
             Controller->hot_size--;
             Controller->hot_list.erase(iter);
-            Controller->hot_map.erase(buf_id);
             SpinLockRelease(&Controller->hot_list_lock);
 
             SpinLockAcquire(&Controller->cold_list_lock);
             Controller->cold_size++;
             Controller->cold_list.emplace_back(buf_id);
-            Controller->cold_map.emplace(buf_id, Controller->cold_list.end() - 1);
+            buf->iter = Controller->cold_list.end() - 1;
             SpinLockRelease(Controller->cold_list_lock);
+
             buf->buftype = NodeType::A1_IN_TYPE;
             buf->hitcount = 1;
             if_demote = true;
@@ -282,24 +282,18 @@ void HitBuffer(int buf_id){
     local_buf_state = LockBufHdr(buf);
 
     if (buf->buftype == NodeType::A1_IN_TYPE) {
-        if (Controller->cold_map.find(buf_id) == Controller->cold_map.end()) {
-            UnlockBufHdr(buf, local_buf_state);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("buffer is not in coldlist"))));
-        }
         if (check_compaction()) {
             buf->hitcount++;
         } else {
-            auto list_iter = Controller->cold_map.at(buf_id);
             SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
             Controller->cold_size--;
-            Controller->cold_list.erase(list_iter);
-            Controller->cold_map.erase(buf_id);
+            Controller->cold_list.erase(buf->iter);
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
 
             SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
             Controller->hot_size++;
             Controller->hot_list.emplace_back(buf_id);
-            Controller->hot_map.emplace(buf_id, Controller->hot_list.end() - 1);
+            buf->iter = Controller->hot_list.end() - 1;
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
 
             buf->buftype = NodeType::AM_TYPE;
@@ -342,7 +336,7 @@ void BufferAdmit(BufferDesc *buf) {
         Controller->cold_size++;
         Controller->cold_list.emplace_back(buf->buf_id);
         buf->buftype = NodeType::A1_IN_TYPE;
-        Controller->cold_map.emplace(buf->buf_id, Controller->cold_list.end() - 1);
+        buf->iter = Controller->cold_list.end() - 1;
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         return;
     }
@@ -358,8 +352,8 @@ void BufferAdmit(BufferDesc *buf) {
     if (check_compation()) {
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list);
         Controller->cold_size++;
-        Controller->cold_list.emplace(buf->buf_id);
-        Controller->cold_map.emplace(buf->buf_id, Controller->cold_list.end() - 1);
+        Controller->cold_list.emplace_back(buf->buf_id);
+        buf->iter = Controller->cold_list.end() - 1;
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         buf->buftype = NodeType::A1_IN_TYPE;
         buf->hitcount = history_hitcount;
@@ -369,7 +363,7 @@ void BufferAdmit(BufferDesc *buf) {
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock) ;
     Controller->hot_size++;
     Controller->hot_list.emplace_back(buf->buf_id);
-    Controller->hot_map.emplace(buf->buf_id, Controller->hot_list.end() - 1);
+    buf->iter = Controller->hot_list.end() - 1;
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
     buf->buftype = NodeType::AM_TYPE;
     buf->hitcount = (Controller->bottom + history_hitcount - 1) % Controller->level_num;
@@ -491,9 +485,7 @@ retry:
 
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         Controller->cold_list.erase(iter);
-        Controller->cold_map.erase(*iter);
         Controller->cold_size--;
-        buf->buftype = NodeType::NONE;
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
 
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
@@ -505,6 +497,9 @@ retry:
         CheckHistoryListSize();
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
+        buf->buftypef = NodeType::NONE;
+        buf->iter = Controller->cold_list.head();
+        buf->hitcount = 0;
         *buf_state = local_buf_state;
         return buf;
     } else if (--try_counter == 0) {
@@ -833,6 +828,16 @@ void StrategyInitialize(bool init)
 
         /* No pending notification */
         t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
+
+        t_thrd.storage_cxt.StrategyControl->cold_size = 0;
+        t_thrd.storage_cxt.StrategyControl->history_size = 0;
+        t_thrd.storage_cxt.StrategyControl->hot_size = 0;
+
+        for (int i = 0; i < TOTAL_BUFFER_NUM; i++) {
+            buf->buftype = NodeType::NONE;
+            buf->hitcount = -1;
+            buf->iter = t_thrd.storage_cxt.StrategyControl->cold_list.head();
+        }
     } else {
         Assert(!init);
     }

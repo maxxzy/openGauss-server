@@ -2765,7 +2765,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          * spinlock still held!
          */
         pgstat_report_waitevent(WAIT_EVENT_BUF_STRATEGY_GET);
-        buf = (BufferDesc *)StrategyGetBuffer(strategy, &buf_state);
+        buf = (BufferDesc *)StrategyGetBuffer_new(strategy, &buf_state);
         pgstat_report_waitevent(WAIT_EVENT_END);
 
         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);

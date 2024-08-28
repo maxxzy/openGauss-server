@@ -223,6 +223,8 @@ typedef struct BufferDesc {
 
     uint32 hitcount;
 
+    std::list<int>::iterator iter;
+
     BufferDescExtra *extra;
 
 #ifdef USE_ASSERT_CHECKING
