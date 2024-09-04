@@ -117,6 +117,12 @@ typedef struct {
     int id;        /* Associated buffer ID */
 } BufferLookupEnt;
 
+typedef struct {
+    BufferTag key;
+    std::list<BufferTag>::iterator iter;
+    int hitcount;
+} BufHistoryHitcount;
+
 #define CLEAR_BUFFERTAG(a)               \
     ((a).rnode.spcNode = InvalidOid,     \
         (a).rnode.dbNode = InvalidOid,   \
@@ -341,6 +347,9 @@ extern void ScheduleBufferTagForWriteback(WritebackContext* context, BufferTag* 
 
 /* freelist.c */
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state);
+extern BufferDesc *StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32 *buf_state);
+extern void BufferAdmit(BufferDesc *buf);
+extern void HitBuffer(int buf_id);
 
 extern void StrategyFreeBuffer(volatile BufferDesc* buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc* buf);
@@ -358,6 +367,10 @@ extern uint32 BufTableHashCode(BufferTag* tagPtr);
 extern int BufTableLookup(BufferTag* tagPtr, uint32 hashcode);
 extern int BufTableInsert(BufferTag* tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag* tagPtr, uint32 hashcode);
+extern int BufHistoryLookup(BufferTag* tagPtr, uint32 hashcode);
+extern int BufHistoryInsert(BufferTag* tagPtr, uint32 hashcode, int hitcount, std::list<BufferTag>::iterator iter);
+extern void BufHistoryDelete(BufferTag* tagPtr, uint32 hashcode);
+extern std::list<BufferTag>::iterator HistoryIterLookup(BufferTag *tag, uint32 hashcode);
 
 /* localbuf.c */
 extern void LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);

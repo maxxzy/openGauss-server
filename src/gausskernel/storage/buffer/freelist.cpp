@@ -68,8 +68,7 @@ typedef struct BufferStrategyControl {
 
     std::list<BufferTag> history_list;
     int history_size;
-    std::unordered_map<BufferTag, std::list<BufferTag>::iterator> history_map;
-    std::unordered_map<BufferTag, int> history_hitcount_map;//buf被淘汰后会用于新buf,buf_tag对应的hitcount需要在history_list中维护
+    struct HTAB* history_hitcount_map;
     slock_t history_list_lock;
 
     std::list<int> hot_list;
@@ -218,8 +217,7 @@ retry:
 
             SpinLockAcquire(&Controller->cold_list_lock);
             Controller->cold_size++;
-            Controller->cold_list.emplace_back(buf_id);
-            buf->iter = Controller->cold_list.end() - 1;
+            buf->iter = Controller->cold_list.insert(Controller->cold_list.end(), buf_id);
             SpinLockRelease(Controller->cold_list_lock);
 
             buf->buftype = NodeType::A1_IN_TYPE;
@@ -256,8 +254,9 @@ bool check_compaction() {
 void CheckHistoryListSize() {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     while (Controller->history_size > Controller->history_capacity){
-        Controller->history_map.erase(Controller->history_list.front());
-        Controller->history_hitcount_map.erase(Controller->history_list.front());
+        BufferTag buf_tag = Controller->history_list.front();
+        uint32 hashcode = BufTableHashCode(&buf_tag)
+        BufHistoryDelete(&buf_tag, hashcode);
         Controller->history_list.pop_front();
         Controller->history_size--;
     }
@@ -292,8 +291,7 @@ void HitBuffer(int buf_id){
 
             SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
             Controller->hot_size++;
-            Controller->hot_list.emplace_back(buf_id);
-            buf->iter = Controller->hot_list.end() - 1;
+            buf->iter = Controller->hot_list.insert(Controller->cold_list.end(), buf_id);
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
 
             buf->buftype = NodeType::AM_TYPE;
@@ -331,39 +329,37 @@ void HitBuffer(int buf_id){
  */
 void BufferAdmit(BufferDesc *buf) {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
-    if (!Controller->history_map.find(buf->tag)) {
+    uint32 hashcode = BufTableHashCode(&buf->tag);
+    int history_hitcount = BufHistoryLookup(&buf->tag, hashcode);
+    if (history_hitcount < 0) {
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         Controller->cold_size++;
-        Controller->cold_list.emplace_back(buf->buf_id);
+        buf->iter = Controller->cold_list.insert(Controller->cold_list.end(), buf->buf_id);
         buf->buftype = NodeType::A1_IN_TYPE;
-        buf->iter = Controller->cold_list.end() - 1;
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         return;
     }
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list);
-    auto list_iter = Controller->history_map.at(buf->tag);
+    auto list_iter = HistoryIterLookup(&buf->tag, hashcode);
     Controller->history_size--;
     Controller->history_list.erase(list_iter);
-    Controller->history_map.erase(buf->buf_id);
-    int history_hitcount = Controller->history_hitcount_map.at(buf->tag) + 1;
+    BufHistoryDelete(&buf->tag, hashcode);
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
     if (check_compation()) {
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list);
         Controller->cold_size++;
-        Controller->cold_list.emplace_back(buf->buf_id);
-        buf->iter = Controller->cold_list.end() - 1;
+        buf->iter = Controller->cold_list.insert(Controller->cold_list.end(), buf->buf_id);
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         buf->buftype = NodeType::A1_IN_TYPE;
-        buf->hitcount = history_hitcount;
+        buf->hitcount = history_hitcount + 1;
         return;
     }
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock) ;
     Controller->hot_size++;
-    Controller->hot_list.emplace_back(buf->buf_id);
-    buf->iter = Controller->hot_list.end() - 1;
+    buf->iter = Controller->hot_list.insert(Controller->cold_list.end(), buf->buf_id);
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
     buf->buftype = NodeType::AM_TYPE;
     buf->hitcount = (Controller->bottom + history_hitcount - 1) % Controller->level_num;
@@ -489,16 +485,19 @@ retry:
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
 
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
-        Controller->history_list.emplace_back(buf->tag);
+        std::list<BufferTag>::iterator new_iter = Controller->history_list.insert(Controller->history_list.end(), buf->tag);
         Controller->history_size++;
-        Controller->history_map.emplace(buf->tag, Controller->history_list.end() - 1);
-        Controller->history_hitcount_map.emplace(buf->tag, buf->hitcount);
+        uint32 hashcode = BufTableHashCode(&buf->tag);
+        if (BufHistoryInsert(&buf->tag, hashcode, buf->hitcount, new_iter) != -1) {
+            UnlockBufHdr(buf, local_buf_state);
+            ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("insert history hitcount error"))));
+        }
         buf->hitcount = 0;
         CheckHistoryListSize();
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
         buf->buftypef = NodeType::NONE;
-        buf->iter = Controller->cold_list.head();
+        buf->iter = Controller->cold_list.begin();
         buf->hitcount = 0;
         *buf_state = local_buf_state;
         return buf;
@@ -834,10 +833,20 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->hot_size = 0;
 
         for (int i = 0; i < TOTAL_BUFFER_NUM; i++) {
+            BufferDesc *buf = GetBufferDescriptor(i);
             buf->buftype = NodeType::NONE;
             buf->hitcount = -1;
-            buf->iter = t_thrd.storage_cxt.StrategyControl->cold_list.head();
+            buf->iter = t_thrd.storage_cxt.StrategyControl->cold_list.begin();
         }
+
+        HASHCTL info;
+        info.keysize = sizeof(BufferTag);
+        info.entrysize = sizeof(BufHistoryHitcount);
+        info.hash = tag_hash;
+        info.num_partitions = NUM_BUFFER_PARTITIONS;
+        int size = t_thrd.storage_cxt.StrategyControl->history_capacity;
+        t_thrd.storage_cxt.StrategyControl->history_hitcount_map = ShmemInitHash("Buffer history table", size, size, &info,
+                                                     HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
     } else {
         Assert(!init);
     }
