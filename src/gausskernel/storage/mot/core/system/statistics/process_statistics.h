@@ -31,7 +31,7 @@
 
 #include "sys/times.h"
 #ifndef OPENEULER_MAJOR
-#include "sys/vtimes.h"
+//#include "sys/vtimes.h"
 #endif
 
 namespace MOT {

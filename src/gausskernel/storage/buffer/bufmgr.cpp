@@ -2709,6 +2709,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          * buffer pool, and check to see if the correct data has been loaded
          * into the buffer.
          */
+        HitBuffer(buf_id);
         buf = GetBufferDescriptor(buf_id);
 
         valid = PinBuffer(buf, strategy);
@@ -2764,7 +2765,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          * spinlock still held!
          */
         pgstat_report_waitevent(WAIT_EVENT_BUF_STRATEGY_GET);
-        buf = (BufferDesc *)StrategyGetBuffer(strategy, &buf_state);
+        buf = (BufferDesc *)StrategyGetBuffer_new(strategy, &buf_state);
         pgstat_report_waitevent(WAIT_EVENT_END);
 
         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
@@ -3061,6 +3062,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         *found = TRUE;
     }
 
+    BufferAdmit(buf);
     return buf;
 }
 
