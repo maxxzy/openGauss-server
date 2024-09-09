@@ -31,6 +31,7 @@
 #include "pgstat.h"
 #include <unordered_map>
 #include <list>
+#include "utils/dynahash.h"
 
 #define INT_ACCESS_ONCE(var) ((int)(*((volatile int *)&(var))))
 
@@ -191,6 +192,63 @@ static inline uint32 ClockSweepTick(int max_nbuffer_can_use)
     return victim;
 }
 
+int BufHistoryLookup(BufferTag *tag, uint32 hashcode)
+{
+    BufHistoryHitcount *result = NULL;
+
+    result = (BufHistoryHitcount *)buf_hash_operate<HASH_FIND>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, NULL);
+
+    if (SECUREC_UNLIKELY(result == NULL)) {
+        return -1;
+    }
+
+    return result->hitcount;
+}
+
+int BufHistoryInsert(BufferTag *tag, uint32 hashcode, int hitcount, std::list<BufferTag>::iterator iter)
+{
+    BufHistoryHitcount *result = NULL;
+    bool found = false;
+
+    Assert(hitcount >= 0);            /* -1 is reserved for not-in-table */
+    Assert(tag->blockNum != P_NEW); /* invalid tag */
+
+    result = (BufHistoryHitcount *)buf_hash_operate<HASH_ENTER>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, &found);
+
+    if (found) { /* found something already in the table */
+        return result->hitcount;
+    }
+
+    result->hitcount = hitcount;
+    result->iter = iter;
+
+    return -1;
+}
+
+void BufHistoryDelete(BufferTag *tag, uint32 hashcode)
+{
+    BufHistoryHitcount *result = NULL;
+
+    result = (BufHistoryHitcount *)buf_hash_operate<HASH_REMOVE>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, NULL);
+
+    if (result == NULL) { /* shouldn't happen */
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), (errmsg("buffer history table corrupted."))));
+    }
+}
+
+std::list<BufferTag>::iterator HistoryIterLookup(BufferTag *tag, uint32 hashcode)
+{
+    BufHistoryHitcount *result = NULL;
+
+    result = (BufHistoryHitcount *)buf_hash_operate<HASH_FIND>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, NULL);
+
+    if (SECUREC_UNLIKELY(result == NULL)) {
+        return t_thrd.storage_cxt.StrategyControl->history_list.end();
+    }
+
+    return result->iter;
+}
+
 /**
  * @description:hotlist中buf小于bottom降级至coldlist,未出现降级则提高bottom重试
  * @return {*}
@@ -218,7 +276,7 @@ retry:
             SpinLockAcquire(&Controller->cold_list_lock);
             Controller->cold_size++;
             buf->iter = Controller->cold_list.insert(Controller->cold_list.end(), buf_id);
-            SpinLockRelease(Controller->cold_list_lock);
+            SpinLockRelease(&Controller->cold_list_lock);
 
             buf->buftype = NodeType::A1_IN_TYPE;
             buf->hitcount = 1;
@@ -255,7 +313,7 @@ void CheckHistoryListSize() {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     while (Controller->history_size > Controller->history_capacity){
         BufferTag buf_tag = Controller->history_list.front();
-        uint32 hashcode = BufTableHashCode(&buf_tag)
+        uint32 hashcode = BufTableHashCode(&buf_tag);
         BufHistoryDelete(&buf_tag, hashcode);
         Controller->history_list.pop_front();
         Controller->history_size--;
@@ -340,15 +398,15 @@ void BufferAdmit(BufferDesc *buf) {
         return;
     }
 
-    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list);
+    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     auto list_iter = HistoryIterLookup(&buf->tag, hashcode);
     Controller->history_size--;
     Controller->history_list.erase(list_iter);
     BufHistoryDelete(&buf->tag, hashcode);
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
-    if (check_compation()) {
-        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list);
+    if (check_compaction()) {
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         Controller->cold_size++;
         buf->iter = Controller->cold_list.insert(Controller->cold_list.end(), buf->buf_id);
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
@@ -456,9 +514,10 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
     }
 
     auto Controller = t_thrd.storage_cxt.StrategyControl;
-    auto iter = Controller->cold_list.begin() + 1;
+    auto iter = Controller->cold_list.begin();
     try_counter = Controller->cold_size;
 retry:
+    iter++;
     int buf_id = *iter;
     buf = GetBufferDescriptor(buf_id);
 
@@ -466,7 +525,7 @@ retry:
             if (++iter == Controller->cold_list.end()) {
                 ereport(WARNING,
                         (errmsg("try get buf headr lock times equal to cold_size when StrategyGetBuffer")));
-                iter = Controller->cold_list.begin() + 1;
+                iter = Controller->cold_list.begin();
             }
             perform_delay(&retry_lock_status);
             goto retry;
@@ -496,7 +555,7 @@ retry:
         CheckHistoryListSize();
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
-        buf->buftypef = NodeType::NONE;
+        buf->buftype = NodeType::NONE;
         buf->iter = Controller->cold_list.begin();
         buf->hitcount = 0;
         *buf_state = local_buf_state;
@@ -794,6 +853,12 @@ void StrategyInitialize(bool init)
     bool found = false;
 
     /*
+     * Get or create the shared strategy control block
+     */
+    t_thrd.storage_cxt.StrategyControl =
+        (BufferStrategyControl *)ShmemInitStruct("Buffer Strategy Status", sizeof(BufferStrategyControl), &found);
+
+    /*
      * Initialize the shared buffer lookup hashtable.
      *
      * Since we can't tolerate running out of lookup table entries, we must be
@@ -804,12 +869,6 @@ void StrategyInitialize(bool init)
      * NBuffers + NUM_BUFFER_PARTITIONS entries.
      */
     InitBufTable(TOTAL_BUFFER_NUM + NUM_BUFFER_PARTITIONS);
-
-    /*
-     * Get or create the shared strategy control block
-     */
-    t_thrd.storage_cxt.StrategyControl =
-        (BufferStrategyControl *)ShmemInitStruct("Buffer Strategy Status", sizeof(BufferStrategyControl), &found);
 
     if (!found) {
         /*
@@ -831,6 +890,7 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->cold_size = 0;
         t_thrd.storage_cxt.StrategyControl->history_size = 0;
         t_thrd.storage_cxt.StrategyControl->hot_size = 0;
+        t_thrd.storage_cxt.StrategyControl->history_capacity = 50;
 
         for (int i = 0; i < TOTAL_BUFFER_NUM; i++) {
             BufferDesc *buf = GetBufferDescriptor(i);

@@ -96,32 +96,6 @@ int BufTableLookup(BufferTag *tag, uint32 hashcode)
     return result->id;
 }
 
-int BufHistoryLookup(BufferTag *tag, uint32 hashcode)
-{
-    BufHistoryHitcount *result = NULL;
-
-    result = (BufHistoryHitcount *)buf_hash_operate<HASH_FIND>(t_thrd.storage_cxt.StrategyControl.history_hitcount_map, tag, hashcode, NULL);
-
-    if (SECUREC_UNLIKELY(result == NULL)) {
-        return -1;
-    }
-
-    return result->hitcount;
-}
-
-std::list<BufferTag>::iterator HistoryIterLookup(BufferTag *tag, uint32 hashcode)
-{
-    BufHistoryHitcount *result = NULL;
-
-    result = (BufHistoryHitcount *)buf_hash_operate<HASH_FIND>(t_thrd.storage_cxt.StrategyControl.history_hitcount_map, tag, hashcode, NULL);
-
-    if (SECUREC_UNLIKELY(result == NULL)) {
-        return -1;
-    }
-
-    return result->iter;
-}
-
 /*
  * BufTableInsert
  *		Insert a hashtable entry for given tag and buffer ID,
@@ -151,26 +125,6 @@ int BufTableInsert(BufferTag *tag, uint32 hashcode, int buf_id)
     return -1;
 }
 
-int BufHistoryInsert(BufferTag *tag, uint32 hashcode, int hitcount, std::list<BufferTag>::iterator iter)
-{
-    BufHistoryHitcount *result = NULL;
-    bool found = false;
-
-    Assert(hitcount >= 0);            /* -1 is reserved for not-in-table */
-    Assert(tag->blockNum != P_NEW); /* invalid tag */
-
-    result = (BufHistoryHitcount *)buf_hash_operate<HASH_ENTER>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, &found);
-
-    if (found) { /* found something already in the table */
-        return result->hitcount;
-    }
-
-    result->hitcount = hitcount;
-    result->iter = iter;
-
-    return -1;
-}
-
 /*
  * BufTableDelete
  *		Delete the hashtable entry for given tag (which must exist)
@@ -185,16 +139,5 @@ void BufTableDelete(BufferTag *tag, uint32 hashcode)
 
     if (result == NULL) { /* shouldn't happen */
         ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), (errmsg("shared buffer hash table corrupted."))));
-    }
-}
-
-void BufHistoryDelete(BufferTag *tag, uint32 hashcode)
-{
-    BufHistoryHitcount *result = NULL;
-
-    result = (BufHistoryHitcount *)buf_hash_operate<HASH_REMOVE>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, NULL);
-
-    if (result == NULL) { /* shouldn't happen */
-        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), (errmsg("buffer history table corrupted."))));
     }
 }
