@@ -119,7 +119,7 @@ typedef struct {
 
 typedef struct {
     BufferTag key;
-    std::list<BufferTag>::iterator iter;
+    int index;
     int hitcount;
 } BufHistoryHitcount;
 
@@ -230,6 +230,7 @@ typedef struct BufferDesc {
     uint32 hitcount;
 
     std::list<int>::iterator iter;
+    int index;
 
     BufferDescExtra *extra;
 
@@ -238,6 +239,8 @@ typedef struct BufferDesc {
 #endif
 } BufferDesc;
 
+#define LIST_CAPACITY 10000
+#define HISTORY_MAXLEN 5000
 /*
  * Concurrent access to buffer headers has proven to be more efficient if
  * they're cache line aligned. So we force the start of the BufferDescriptors
@@ -368,9 +371,9 @@ extern int BufTableLookup(BufferTag* tagPtr, uint32 hashcode);
 extern int BufTableInsert(BufferTag* tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag* tagPtr, uint32 hashcode);
 extern int BufHistoryLookup(BufferTag* tagPtr, uint32 hashcode);
-extern int BufHistoryInsert(BufferTag* tagPtr, uint32 hashcode, int hitcount, std::list<BufferTag>::iterator iter);
+extern int BufHistoryInsert(BufferTag* tagPtr, uint32 hashcode, int hitcount, int index);
 extern void BufHistoryDelete(BufferTag* tagPtr, uint32 hashcode);
-extern std::list<BufferTag>::iterator HistoryIterLookup(BufferTag *tag, uint32 hashcode);
+extern int HistoryIndexLookup(BufferTag *tag, uint32 hashcode);
 
 /* localbuf.c */
 extern void LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
