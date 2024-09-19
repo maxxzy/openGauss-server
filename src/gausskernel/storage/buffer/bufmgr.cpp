@@ -3063,6 +3063,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
     }
 
     BufferAdmit(buf);
+    ereport(WARNING, (errmsg("Buffer alloc return a buffer after BufferAdmit")));
     return buf;
 }
 

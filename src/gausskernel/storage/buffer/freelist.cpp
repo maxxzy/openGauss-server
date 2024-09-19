@@ -62,6 +62,8 @@ typedef struct BufferStrategyControl {
      */
     int bgwprocno;
 
+    pg_atomic_uint32 firstVictimBuffer;
+
     int cold_list[LIST_CAPACITY];
     int cold_size;
     int cold_head;
@@ -75,7 +77,7 @@ typedef struct BufferStrategyControl {
     struct HTAB* history_hitcount_map;
     slock_t history_list_lock;
 
-    int hot_list[LIST_CAPACITY];
+    int hot_list[HOT_CAPACITY];
     int hot_tail;
     int hot_size;
     slock_t hot_list_lock;
@@ -293,12 +295,12 @@ retry:
         if (buf->hitcount == bottom) {
             SpinLockAcquire(&Controller->hot_list_lock);
             Controller->hot_size--;
-            Controller->hot_list[i] = -1;
+            Controller->hot_list[index] = -1;
             SpinLockRelease(&Controller->hot_list_lock);
 
             SpinLockAcquire(&Controller->cold_list_lock);
             Controller->cold_size++;
-            NextIndex(&Controller->cold_tail);
+            NextIndex(&Controller->cold_tail, LIST_CAPACITY);
             buf->index = Controller->cold_tail;
             Controller->cold_list[Controller->cold_tail] = buf_id;
             SpinLockRelease(&Controller->cold_list_lock);
@@ -320,7 +322,7 @@ retry:
         goto retry;
     }
     Controller->hot_tail = slow - 1;
-    Controller->hot_size =- slow;
+    Controller->hot_size = slow;
     Controller->in_compaction = false;
 }
 
@@ -329,7 +331,7 @@ bool check_compaction() {
     if (Controller->in_compaction) {
         return true;
     }
-    if (Controller->hot_size >= LIST_CAPACITY) {
+    if (Controller->hot_size >= HOT_CAPACITY) {
         Controller->in_compaction = true;
         compaction();
         return false;
@@ -348,7 +350,7 @@ void CheckHistoryListSize() {
         BufferTag buf_tag = Controller->history_list[Controller->history_head];
         uint32 hashcode = BufTableHashCode(&buf_tag);
         BufHistoryDelete(&buf_tag, hashcode);
-        Controller->history_list[Controller->history_head] = -1;
+        Controller->history_list[Controller->history_head] = {};
         NextIndex(&Controller->history_head, HISTORY_MAXLEN);
         Controller->history_size--;
     }
@@ -384,14 +386,16 @@ void HitBuffer(int buf_id){
                 i = (i + 1) % LIST_CAPACITY;
             }
             Controller->cold_list[i] = -1;
-            PrevIndex(&Controller->cold_tail);
+            PrevIndex(&Controller->cold_tail, LIST_CAPACITY);
+            ereport(WARNING, (errmsg("now cold tail = %d", Controller->cold_tail)));
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
 
             SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
             Controller->hot_size++;
-            NextIndex(&Controller->hot_tail);
+            NextIndex(&Controller->hot_tail, HOT_CAPACITY);
             buf->index = Controller->hot_tail;
             Controller->hot_list[Controller->hot_tail] = buf_id;
+            ereport(WARNING, (errmsg("insert into hot list buf_id = %d, hot_tail = %d", buf_id, Controller->hot_tail)));
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
 
             buf->buftype = BufferType::Hot;
@@ -433,13 +437,14 @@ void BufferAdmit(BufferDesc *buf) {
     uint32 hashcode = BufTableHashCode(&buf->tag);
     int history_hitcount = BufHistoryLookup(&buf->tag, hashcode);
     if (history_hitcount < 0) {
-        ereport(WARNING, (errmsg("add into coldlist")));
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         NextIndex(&Controller->cold_tail, LIST_CAPACITY);
         buf->index = Controller->cold_tail;
         Controller->cold_size++;
         Controller->cold_list[buf->index] = buf->buf_id;
         buf->buftype = BufferType::Cold;
+        buf->hitcount = 1;
+        ereport(WARNING, (errmsg("add into coldlist, buf_id = %d, cold_tail = %d", buf->buf_id, Controller->cold_tail)));
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         return;
     }
@@ -447,15 +452,15 @@ void BufferAdmit(BufferDesc *buf) {
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     auto list_index = HistoryIndexLookup(&buf->tag, hashcode);
     Controller->history_size--;
-    Controller->history_list[list_index] = NULL;
+    Controller->history_list[list_index] = {};
     BufHistoryDelete(&buf->tag, hashcode);
     int i = list_index;
     while (i != Controller->history_tail) {
         Controller->history_list[i] = Controller->history_list[(i + 1) % HISTORY_MAXLEN];
         i = (i + 1) % HISTORY_MAXLEN;
     }
-    Controller->history_list[i] = -1;
-    PrevIndex(Controller->history_tail, HISTORY_MAXLEN);
+    Controller->history_list[i] = {};
+    PrevIndex(&Controller->history_tail, HISTORY_MAXLEN);
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
     if (check_compaction()) {
@@ -572,6 +577,21 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
     }
 
     auto Controller = t_thrd.storage_cxt.StrategyControl;
+    int buf_id = pg_atomic_read_u32(&Controller->firstVictimBuffer);
+    if (buf_id < LIST_CAPACITY) {
+        ereport(WARNING, (errmsg("get next victim buffer without algorithmi, buf_id = %d", buf_id)));
+        buf = GetBufferDescriptor(buf_id);
+        local_buf_state = LockBufHdr(buf);
+        if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
+            (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
+            if (strategy != NULL)
+                AddBufferToRing(strategy, buf);
+            *buf_state = local_buf_state;
+            (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
+            (void)pg_atomic_fetch_add_u32(&Controller->firstVictimBuffer, 1);
+            return buf;
+        }
+    }
     if (am_standby)
         max_buffer_can_use = int(NORMAL_SHARED_BUFFER_NUM * u_sess->attr.attr_storage.shared_buffers_fraction);
     else
@@ -586,7 +606,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
 
     int index = Controller->cold_head;
     while (index !=  (Controller->cold_tail + 1) % LIST_CAPACITY) {
-        int buf_id = Controller->cold_list[index];
+        buf_id = Controller->cold_list[index];
         ereport(WARNING, (errmsg("get buf_id %d", buf_id)));
         buf = GetBufferDescriptor(buf_id);
 
@@ -946,6 +966,8 @@ void StrategyInitialize(bool init)
         /* Initialize the clock sweep pointer */
         pg_atomic_init_u32(&t_thrd.storage_cxt.StrategyControl->nextVictimBuffer, 0);
 
+        pg_atomic_init_u32(&t_thrd.storage_cxt.StrategyControl->firstVictimBuffer, 0);
+
         /* Clear statistics */
         t_thrd.storage_cxt.StrategyControl->completePasses = 0;
         pg_atomic_init_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 0);
@@ -958,20 +980,19 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->hot_size = 0;
 
         t_thrd.storage_cxt.StrategyControl->cold_head = 0;
-        t_thrd.storage_cxt.StrategyControl->hot_head = 0;
         t_thrd.storage_cxt.StrategyControl->history_head = 0;
         t_thrd.storage_cxt.StrategyControl->cold_tail = -1;
         t_thrd.storage_cxt.StrategyControl->hot_tail = -1;
         t_thrd.storage_cxt.StrategyControl->history_tail = -1;
 
-        if (t_thrd.storage_cxt.StrategyControl->cold_list.empty()) {
-            ereport(WARNING, (errmsg("coldlist is empty in func StrategyInitialize")));
-        }
+        t_thrd.storage_cxt.StrategyControl->level_num = 8;
+        t_thrd.storage_cxt.StrategyControl->bottom = 0;
 
         for (int i = 0; i < TOTAL_BUFFER_NUM; i++) {
             BufferDesc *buf = GetBufferDescriptor(i);
             buf->buftype = BufferType::NONE;
-            buf->hitcount = -1;
+            buf->index = -1;
+            buf->hitcount = 0;
         }
 
         HASHCTL info;

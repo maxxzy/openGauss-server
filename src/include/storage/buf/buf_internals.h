@@ -239,7 +239,8 @@ typedef struct BufferDesc {
 #endif
 } BufferDesc;
 
-#define LIST_CAPACITY 10000
+#define LIST_CAPACITY 130000
+#define HOT_CAPACITY 40000
 #define HISTORY_MAXLEN 5000
 /*
  * Concurrent access to buffer headers has proven to be more efficient if
