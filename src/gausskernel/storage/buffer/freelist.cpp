@@ -485,6 +485,49 @@ void BufferAdmit(BufferDesc *buf) {
     buf->hitcount = (Controller->bottom + history_hitcount - 1) % Controller->level_num;
 }
 
+void DeleteBufFromList(BufferDesc *buf) {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    if (buf->buftype == BufferType::Cold) {
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        int index = buf->index;
+        while (index != Controller->cold_tail) {
+            Controller->cold_list[index] = Controller->cold_list[(index + 1) % LIST_CAPACITY];
+            index = (index + 1) % LIST_CAPACITY;
+        }
+        Controller->cold_list[index] = -1;
+        PrevIndex(&Controller->cold_tail, LIST_CAPACITY);
+        Controller->cold_size--;
+        SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+    } else {
+        SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+        int index = buf->index;
+        while (index != Controller->hot_tail) {
+            Controller->hot_list[index] = Controller->hot_list[(index + 1)];
+            index++;
+        }
+        Controller->hot_list[index] = -1;
+        Controller->hot_tail--;
+        Controller->hot_size--;
+        SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+    }
+
+    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
+    NextIndex(&Controller->history_tail, HISTORY_MAXLEN);
+    Controller->history_list[Controller->history_tail] = buf->tag;
+    Controller->history_size++;
+    uint32 hashcode = BufTableHashCode(&buf->tag);
+    if (BufHistoryInsert(&buf->tag, hashcode, buf->hitcount, Controller->history_tail) == -1) {
+        UnlockBufHdr(buf, local_buf_state);
+        ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("insert history hitcount error"))));
+    }
+    CheckHistoryListSize();
+    SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
+
+    buf->buftype = BufferType::NONE;
+    buf->buf_id = -1;
+    buf->hitcount = 0;
+}
+
 /**
  * @description:从coldlist中淘汰(fifo),如果当前buf已被pin住或不合适会考虑coldlist中其他buf
  * 找到合适的buf后从coldlist中移入historylist,historylist维护buftag和hitcount
@@ -561,6 +604,9 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
                 buf = get_buf_from_candidate_list(strategy, buf_state);
                 if (buf != NULL) {
                     (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
+                    if (buf->buftype != BufferType::NONE) {
+                        DeleteBufFromList(buf);
+                    }
                     return buf;
                 }
                 pg_usleep(sleepTime);
@@ -571,6 +617,9 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             buf = get_buf_from_candidate_list(strategy, buf_state);
             if (buf != NULL) {
                 (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
+                if (buf->buftype != BufferType::NONE) {
+                    DeleteBufFromList(buf);
+                }
                 return buf;
             }
         }
