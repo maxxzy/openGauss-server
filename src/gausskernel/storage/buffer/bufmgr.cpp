@@ -552,6 +552,7 @@ static bool ConditionalStartBufferIO(BufferDesc *buf, bool for_input)
 static volatile BufferDesc *PageListBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num,
                                                 BlockNumber block_num, BufferAccessStrategy strategy, bool *found)
 {
+    ereport(LOG, (errmsg("PageListBufferAlloc????????????")));
     int buf_id;
     BufferDesc *buf = NULL;
     BufferTag new_tag;                 /* identity of requested block */
@@ -2704,6 +2705,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
     buf_id = BufTableLookup(&new_tag, new_hash);
     pgstat_report_waitevent(WAIT_EVENT_END);
     if (buf_id >= 0) {
+        ereport(LOG, (errmsg("BufferAlloc: find buf_tag int buftable, buf_id = %d", buf_id)));
         /*
          * Found it.  Now, pin the buffer so no one can steal it from the
          * buffer pool, and check to see if the correct data has been loaded
