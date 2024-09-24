@@ -2709,11 +2709,11 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          * buffer pool, and check to see if the correct data has been loaded
          * into the buffer.
          */
-        HitBuffer(buf_id);
         buf = GetBufferDescriptor(buf_id);
 
         valid = PinBuffer(buf, strategy);
 
+        HitBuffer(buf_id);
         /* Can release the mapping lock as soon as we've pinned it */
         LWLockRelease(new_partition_lock);
 
@@ -3063,7 +3063,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
     }
 
     BufferAdmit(buf);
-    ereport(WARNING, (errmsg("Buffer alloc return a buffer after BufferAdmit")));
+    ereport(LOG, (errmsg("Buffer alloc return a buffer after BufferAdmit")));
     return buf;
 }
 
