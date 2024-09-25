@@ -239,9 +239,9 @@ typedef struct BufferDesc {
 #endif
 } BufferDesc;
 
-#define LIST_CAPACITY 130000
-#define HOT_CAPACITY 40000
-#define HISTORY_MAXLEN 5000
+#define LIST_CAPACITY 150000
+#define HOT_CAPACITY 150000
+#define HISTORY_MAXLEN 50000
 /*
  * Concurrent access to buffer headers has proven to be more efficient if
  * they're cache line aligned. So we force the start of the BufferDescriptors
@@ -352,6 +352,7 @@ extern void ScheduleBufferTagForWriteback(WritebackContext* context, BufferTag* 
 /* freelist.c */
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state);
 extern BufferDesc *StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32 *buf_state);
+extern void DeleteBufFromList(BufferDesc *buf);
 extern void BufferAdmit(BufferDesc *buf);
 extern void HitBuffer(int buf_id);
 

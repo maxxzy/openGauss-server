@@ -95,6 +95,12 @@ const long CHKPT_LOG_TIME_INTERVAL = 1000000 * 60; /* 60000000us -> 1min */
 const double CHKPT_LOG_PERCENT_INTERVAL = 0.1;
 const uint32 ESTIMATED_MIN_BLOCKS = 10000;
 
+enum BufferType : uint8_t {
+    NONE = 0,
+    Cold = 1,
+    Hot = 2
+};
+
 /*
  * Status of buffers to checkpoint for a particular tablespace, used
  * internally in BufferSync.
@@ -552,7 +558,6 @@ static bool ConditionalStartBufferIO(BufferDesc *buf, bool for_input)
 static volatile BufferDesc *PageListBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num,
                                                 BlockNumber block_num, BufferAccessStrategy strategy, bool *found)
 {
-    ereport(LOG, (errmsg("PageListBufferAlloc????????????")));
     int buf_id;
     BufferDesc *buf = NULL;
     BufferTag new_tag;                 /* identity of requested block */
@@ -2290,6 +2295,7 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
          * not currently in memory.
          */
         bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum, strategy, &found, pblk);
+        ereport(LOG, (errmsg("ReadBuffer_common get a buffer, buf_id = %d", bufHdr->buf_id)));
         if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
             bufHdr->extra->encrypt = smgr->encrypt ? true : false; /* set tde flag */
         }
@@ -2705,7 +2711,6 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
     buf_id = BufTableLookup(&new_tag, new_hash);
     pgstat_report_waitevent(WAIT_EVENT_END);
     if (buf_id >= 0) {
-        ereport(LOG, (errmsg("BufferAlloc: find buf_tag int buftable, buf_id = %d", buf_id)));
         /*
          * Found it.  Now, pin the buffer so no one can steal it from the
          * buffer pool, and check to see if the correct data has been loaded
@@ -3015,6 +3020,14 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
      * checkpoints, except for their "init" forks, which need to be treated
      * just like permanent relations.
      */
+    if (buf->buftype != BufferType::NONE) {
+        if (strategy != NULL) {
+            buf->hitcount = 1;
+        } else {
+            DeleteBufFromList(buf);
+            ereport(LOG, (errmsg("delete successfully buf_id = %d", &buf->buf_id)));
+        }
+    }
     ((BufferDesc *)buf)->tag = new_tag;
     buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT |
                    BUF_USAGECOUNT_MASK);
@@ -3023,6 +3036,10 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         buf_state |= BM_TAG_VALID | BM_PERMANENT | BUF_USAGECOUNT_ONE;
     } else {
         buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
+    }
+
+    if (strategy == NULL) {
+        BufferAdmit(buf);
     }
 
     UnlockBufHdr(buf, buf_state);
@@ -3064,8 +3081,6 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         *found = TRUE;
     }
 
-    BufferAdmit(buf);
-    ereport(LOG, (errmsg("Buffer alloc return a buffer after BufferAdmit")));
     return buf;
 }
 
