@@ -70,7 +70,7 @@ typedef struct BufferStrategyControl {
     int cold_tail;
     slock_t cold_list_lock;
 
-    BufferTag history_list[HISTORY_MAXLEN];
+    BufferTag history_list[HISTORY_LISTLEN];
     int history_head;
     int history_tail;
     int history_size;
@@ -82,8 +82,12 @@ typedef struct BufferStrategyControl {
     int hot_size;
     slock_t hot_list_lock;
 
+    BufferDesc *cold_head;
+    BufferDesc *cold_tail;
+    BufferDesc *hot_head;
+    BufferDesc *hot_tail;
+
     uint32 bottom;
-    uint32 level_num;
     uint32 history_capacity;
 
     bool in_compaction;
@@ -104,7 +108,8 @@ const float NEED_DELAY_RETRY_GET_BUF = 0.8;
 enum BufferType : uint8_t {
     NONE = 0,
     Cold = 1,
-    Hot = 2
+    Hot = 2,
+    AddToRing = 3
 };
 
 /* Prototypes for internal functions */
@@ -215,7 +220,8 @@ int BufHistoryLookup(BufferTag *tag, uint32 hashcode)
 
 int BufHistoryInsert(BufferTag *tag, uint32 hashcode, int hitcount, int index)
 {
-    ereport(LOG, (errmsg("Try insert buf_tag into historytable, blockNum = %d, forkNum = %d", tag->blockNum, tag->forkNum)));
+    ereport(LOG, (errmsg("Try insert buf_tag into historytable, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
+             tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->blockNum, tag->forkNum)));
     BufHistoryHitcount *result = NULL;
     bool found = false;
 
@@ -238,6 +244,8 @@ int BufHistoryInsert(BufferTag *tag, uint32 hashcode, int hitcount, int index)
 
 void BufHistoryDelete(BufferTag *tag, uint32 hashcode)
 {
+    ereport(LOG, (errmsg("try delete buf_tag, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
+             tag->rnode.spcNode, tag->rnode.dbNode, tag->rnode.relNode, tag->blockNum, tag->forkNum)));
     BufHistoryHitcount *result = NULL;
 
     result = (BufHistoryHitcount *)buf_hash_operate<HASH_REMOVE>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, NULL);
@@ -258,6 +266,21 @@ int HistoryIndexLookup(BufferTag *tag, uint32 hashcode)
     }
 
     return result->index;
+}
+
+void UpdateHistoryIndex(BufferTag *tag, uint32 hashcode, int new_index)
+{
+    BufHistoryHitcount *result = NULL;
+    bool found = false;
+
+    result = (BufHistoryHitcount *)buf_hash_operate<HASH_ENTER>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, &found);
+
+    if (found) { /* found something already in the table */
+        result->index = new_index;
+        return;
+    }
+
+    ereport(WARNING, (errmsg("no history in table")));
 }
 
 void NextIndex(int *index, int capacity){
@@ -286,46 +309,54 @@ void compaction() {
     bool if_demote = false;
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     auto bottom = Controller->bottom;
+    int demote_cnt = 0;
     ereport(LOG, (errmsg("start compaction hot size = %d", Controller->hot_size)));
+    SpinLockAcquire(&Controller->hot_list_lock);
+    SpinLockAcquire(&Controller->cold_list_lock);
 retry:
     int index = 0;
     int slow = 0;
     while(index <= Controller->hot_tail) {
         int buf_id = Controller->hot_list[index];
         buf = GetBufferDescriptor(buf_id);
+        //ereport(LOG, (errmsg("compaction check buf_id = %d, index = %d", buf_id, index)));
         local_buf_state = LockBufHdr(buf);
         if (buf->hitcount == bottom) {
-            SpinLockAcquire(&Controller->hot_list_lock);
+            //ereport(LOG, (errmsg("buf_id = %d need compaction, buf_hitcount = %d", buf_id, buf->hitcount)));
             Controller->hot_size--;
             Controller->hot_list[index] = -1;
-            SpinLockRelease(&Controller->hot_list_lock);
 
-            SpinLockAcquire(&Controller->cold_list_lock);
             Controller->cold_size++;
             NextIndex(&Controller->cold_tail, LIST_CAPACITY);
             buf->index = Controller->cold_tail;
             Controller->cold_list[Controller->cold_tail] = buf_id;
-            SpinLockRelease(&Controller->cold_list_lock);
+            //ereport(LOG, (errmsg("compaction insert into cold buf_id = %d, cold_tail = %d, cold_size = %d", buf_id, Controller->cold_tail, Controller->cold_size)));
 
             buf->buftype = BufferType::Cold;
             buf->hitcount = 1;
             if_demote = true;
             UnlockBufHdr(buf, local_buf_state);
             index++;
+            demote_cnt++;
             continue;
         }
-        UnlockBufHdr(buf, local_buf_state);
         Controller->hot_list[slow] = Controller->hot_list[index];
+        buf->index = slow;
+        UnlockBufHdr(buf, local_buf_state);
+        //ereport(LOG, (errmsg("compaction move buf_id = %d, old index = %d, new_index = %d", buf_id, index, slow)));
         index++;
         slow++;
     }
     if (!if_demote) {
-        bottom = (bottom + 1) % Controller->level_num;
+        bottom = (bottom + 1) % LEVEL_NUM;
         goto retry;
     }
     Controller->hot_tail = slow - 1;
     Controller->hot_size = slow;
     Controller->in_compaction = false;
+    SpinLockRelease(&Controller->cold_list_lock);
+    SpinLockRelease(&Controller->hot_list_lock);
+    ereport(LOG, (errmsg("compaction complete, demote_cnt = %d, hot_tail = %d, hot_size = %d", demote_cnt, Controller->hot_tail, Controller->hot_size)));
 }
 
 bool check_compaction() {
@@ -333,7 +364,7 @@ bool check_compaction() {
     if (Controller->in_compaction) {
         return true;
     }
-    if (Controller->hot_size >= HOT_CAPACITY) {
+    if (Controller->hot_size >= HOT_CAPACITY - 1000) {
         Controller->in_compaction = true;
         compaction();
         return true;
@@ -355,7 +386,7 @@ void CheckHistoryListSize() {
         uint32 hashcode = BufTableHashCode(&buf_tag);
         BufHistoryDelete(&buf_tag, hashcode);
         Controller->history_list[Controller->history_head] = {};
-        NextIndex(&Controller->history_head, HISTORY_MAXLEN);
+        NextIndex(&Controller->history_head, HISTORY_LISTLEN);
         Controller->history_size--;
         ereport(LOG, (errmsg("pop from history, history head = %d", Controller->history_head)));
     }
@@ -392,12 +423,18 @@ void HitBuffer(int buf_id){
             Controller->cold_size--;
             int i = buf->index;
             while (i != Controller->cold_tail) {
+                ereport(LOG, (errmsg("index = %d, buf_id = %d", i, Controller->cold_list[(i + 1) % LIST_CAPACITY])));
+                BufferDesc *old_buf = GetBufferDescriptor(Controller->cold_list[(i + 1) % LIST_CAPACITY]);
+                uint32 old_buf_state = LockBufHdr(old_buf);
+                ereport(LOG, (errmsg("get buffer hdr lock")));
                 Controller->cold_list[i] = Controller->cold_list[(i + 1) % LIST_CAPACITY];
+                old_buf->index = i;
                 i = (i + 1) % LIST_CAPACITY;
+                UnlockBufHdr(old_buf, old_buf_state);
             }
             Controller->cold_list[i] = -1;
             PrevIndex(&Controller->cold_tail, LIST_CAPACITY);
-            ereport(LOG, (errmsg("now cold tail = %d, cold size = %d", Controller->cold_tail, Controller->cold_size)));
+            ereport(LOG, (errmsg("now cold_tail = %d, cold_size = %d", Controller->cold_tail, Controller->cold_size)));
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
 
             SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
@@ -409,7 +446,7 @@ void HitBuffer(int buf_id){
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
 
             buf->buftype = BufferType::Hot;
-            buf->hitcount = (Controller->bottom + buf->hitcount - 1) % Controller->level_num;
+            buf->hitcount = (Controller->bottom + buf->hitcount - 1) % LEVEL_NUM;
         }
         UnlockBufHdr(buf, local_buf_state);
         return;
@@ -423,7 +460,7 @@ void HitBuffer(int buf_id){
             }
         }
         */
-        buf->hitcount = (buf->hitcount + 1) % 10; //调试使用
+        buf->hitcount = (buf->hitcount + 1) % LEVEL_NUM; //调试使用
         ereport(LOG, (errmsg("buffer is already hot change hitcount buf_id = %d, hitcount = %d", buf_id, buf->hitcount)));
         UnlockBufHdr(buf, local_buf_state);
         return;
@@ -450,9 +487,11 @@ void BufferAdmit(BufferDesc *buf) {
     ereport(LOG, (errmsg("BufferAdmit, buf_id = %d", buf->buf_id)));
     auto Controller = t_thrd.storage_cxt.StrategyControl;
 
+    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     uint32 hashcode = BufTableHashCode(&buf->tag);
     int history_hitcount = BufHistoryLookup(&buf->tag, hashcode);
     if (history_hitcount < 0) {
+        SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         NextIndex(&Controller->cold_tail, LIST_CAPACITY);
         buf->index = Controller->cold_tail;
@@ -465,18 +504,19 @@ void BufferAdmit(BufferDesc *buf) {
         return;
     }
 
-    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     auto list_index = HistoryIndexLookup(&buf->tag, hashcode);
     Controller->history_size--;
     Controller->history_list[list_index] = {};
     BufHistoryDelete(&buf->tag, hashcode);
     int i = list_index;
     while (i != Controller->history_tail) {
-        Controller->history_list[i] = Controller->history_list[(i + 1) % HISTORY_MAXLEN];
-        i = (i + 1) % HISTORY_MAXLEN;
+        uint32 current_hash = BufTableHashCode(&Controller->history_list[(i + 1) % HISTORY_LISTLEN]);
+        UpdateHistoryIndex(&Controller->history_list[(i + 1) % HISTORY_LISTLEN], current_hash, i);
+        Controller->history_list[i] = Controller->history_list[(i + 1) % HISTORY_LISTLEN];
+        i = (i + 1) % HISTORY_LISTLEN;
     }
     Controller->history_list[i] = {};
-    PrevIndex(&Controller->history_tail, HISTORY_MAXLEN);
+    PrevIndex(&Controller->history_tail, HISTORY_LISTLEN);
     ereport(LOG, (errmsg("get buf from history, hitcount = %d, history size = %d, history tail = %d", history_hitcount, Controller->history_size, Controller->history_tail)));
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
@@ -500,7 +540,7 @@ void BufferAdmit(BufferDesc *buf) {
     Controller->hot_list[Controller->hot_tail] = buf->buf_id;
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
     buf->buftype = BufferType::Hot;
-    buf->hitcount = (Controller->bottom + history_hitcount - 1) % Controller->level_num;
+    buf->hitcount = (Controller->bottom + history_hitcount - 1) % LEVEL_NUM;
     ereport(LOG, (errmsg("add into hot, hot_size = %d, hot_tail = %d, hitcount = %d, buf_typy = %d", Controller->hot_size, Controller->hot_tail, buf->hitcount, buf->buftype)));
 }
 
@@ -510,27 +550,35 @@ void DeleteBufFromList(BufferDesc *buf) {
     if (buf->buftype == BufferType::Cold) {
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         int index = buf->index;
+        Controller->cold_size--;
         if (index == Controller->cold_head) {
             Controller->cold_list[index] = -1;
             NextIndex(&Controller->cold_head, LIST_CAPACITY);
             ereport(LOG, (errmsg("cold list pop, cold_size = %d, cold_head = %d", Controller->cold_size, Controller->cold_tail)));
         } else {
             while (index != Controller->cold_tail) {
+                BufferDesc *old_buf = GetBufferDescriptor(Controller->cold_list[(index + 1) % LIST_CAPACITY]);
+                uint32 old_buf_state = LockBufHdr(old_buf);
                 Controller->cold_list[index] = Controller->cold_list[(index + 1) % LIST_CAPACITY];
+                old_buf->index = index;
                 index = (index + 1) % LIST_CAPACITY;
+                UnlockBufHdr(old_buf, old_buf_state);
             }
             Controller->cold_list[index] = -1;
             PrevIndex(&Controller->cold_tail, LIST_CAPACITY);
             ereport(LOG, (errmsg("delete from cold, cold_size = %d, cold_tail = %d", Controller->cold_size, Controller->cold_tail)));
         }
-        Controller->cold_size;
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
     } else {
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
         int index = buf->index;
         while (index != Controller->hot_tail) {
-            Controller->hot_list[index] = Controller->hot_list[(index + 1)];
+            BufferDesc *old_buf = GetBufferDescriptor(Controller->hot_list[index + 1]);
+            uint32 old_buf_state = LockBufHdr(old_buf);
+            Controller->hot_list[index] = Controller->hot_list[index + 1];
+            old_buf->index = index;
             index++;
+            UnlockBufHdr(old_buf, old_buf_state);
         }
         Controller->hot_list[index] = -1;
         Controller->hot_tail--;
@@ -540,7 +588,7 @@ void DeleteBufFromList(BufferDesc *buf) {
     }
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
-    NextIndex(&Controller->history_tail, HISTORY_MAXLEN);
+    NextIndex(&Controller->history_tail, HISTORY_LISTLEN);
     Controller->history_list[Controller->history_tail] = buf->tag;
     Controller->history_size++;
     ereport(LOG, (errmsg("insert into history history_size = %d, history_tail = %d", Controller->history_size, Controller->history_tail)));
@@ -718,7 +766,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             if (strategy != NULL) {
                 AddBufferToRing(strategy, buf);
                 DeleteBufFromList(buf);
-                InsertIntoColdList(buf);
+                buf->buftype = BufferType::AddToRing;
             }
             *buf_state = local_buf_state;
             (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_clock_sweep, 1);
@@ -963,6 +1011,11 @@ void StrategyNotifyBgWriter(int bgwproc_no)
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->buffer_strategy_lock);
 }
 
+Size BufHistoryTabShmemSize(int size)
+{
+    return hash_estimate_size(size, sizeof(BufHistoryHitcount));
+}
+
 /*
  * StrategyShmemSize
  *
@@ -981,6 +1034,8 @@ Size StrategyShmemSize(void)
     /* size of the shared replacement strategy control block */
     size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
+    size = add_size(size, BufHistoryTabShmemSize(HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS));
+
     return size;
 }
 
@@ -993,7 +1048,7 @@ Size StrategyShmemSize(void)
  */
 void StrategyInitialize(bool init)
 {
-    ereport(WARNING, (errmsg("--------------------------StrategyInitialize")));
+    ereport(WARNING, (errmsg("--------------------------StrategyInitialize, buffer_num = %d", TOTAL_BUFFER_NUM)));
     bool found = false;
 
     /*
@@ -1045,8 +1100,7 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->hot_tail = -1;
         t_thrd.storage_cxt.StrategyControl->history_tail = -1;
 
-        t_thrd.storage_cxt.StrategyControl->level_num = 8;
-        t_thrd.storage_cxt.StrategyControl->bottom = 0;
+        t_thrd.storage_cxt.StrategyControl->bottom = 1;
 
         t_thrd.storage_cxt.StrategyControl->if_get_from_free = false;
 
@@ -1062,7 +1116,7 @@ void StrategyInitialize(bool init)
         info.entrysize = sizeof(BufHistoryHitcount);
         info.hash = tag_hash;
         info.num_partitions = NUM_BUFFER_PARTITIONS;
-        int size = HISTORY_MAXLEN;
+        int size = HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS;
         t_thrd.storage_cxt.StrategyControl->history_hitcount_map = ShmemInitHash("Buffer history table", size, size, &info,
                                                      HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
     } else {
@@ -1366,7 +1420,7 @@ static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, ui
                             AddBufferToRing(strategy, buf);
                             if (buf->buftype != BufferType::NONE)
                                 DeleteBufFromList(buf);
-                            InsertIntoColdList(buf);
+                            buf->buftype = BufferType::AddToRing;
                         }
                         *buf_state = local_buf_state;
                         if (candidate_dirty_list != NULL) {
@@ -1396,7 +1450,7 @@ static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, ui
                     AddBufferToRing(strategy, buf);
                     if (buf->buftype != BufferType::NONE)
                         DeleteBufFromList(buf);
-                    InsertIntoColdList(buf);
+                    buf->buftype = BufferType::AddToRing;
                 }
                 *buf_state = local_buf_state;
                 pfree(candidate_dirty_list);

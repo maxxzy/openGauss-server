@@ -98,7 +98,8 @@ const uint32 ESTIMATED_MIN_BLOCKS = 10000;
 enum BufferType : uint8_t {
     NONE = 0,
     Cold = 1,
-    Hot = 2
+    Hot = 2,
+    AddToRing = 3
 };
 
 /*
@@ -558,6 +559,7 @@ static bool ConditionalStartBufferIO(BufferDesc *buf, bool for_input)
 static volatile BufferDesc *PageListBufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber fork_num,
                                                 BlockNumber block_num, BufferAccessStrategy strategy, bool *found)
 {
+    ereport(WARNING, (errmsg("PageListBufferAlloc!!!!!")));
     int buf_id;
     BufferDesc *buf = NULL;
     BufferTag new_tag;                 /* identity of requested block */
@@ -3025,7 +3027,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             buf->hitcount = 1;
         } else {
             DeleteBufFromList(buf);
-            ereport(LOG, (errmsg("delete successfully buf_id = %d", &buf->buf_id)));
+            ereport(LOG, (errmsg("delete successfully buf_id = %d", buf->buf_id)));
         }
     }
     ((BufferDesc *)buf)->tag = new_tag;
@@ -3040,6 +3042,9 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
 
     if (strategy == NULL) {
         BufferAdmit(buf);
+    }
+    if (buf->buftype == BufferType::AddToRing && strategy != NULL) {
+        InsertIntoColdList(buf);
     }
 
     UnlockBufHdr(buf, buf_state);
