@@ -229,8 +229,8 @@ typedef struct BufferDesc {
 
     uint32 hitcount;
 
-    std::list<int>::iterator iter;
-    int index;
+    BufferDesc* next;
+    BufferDesc* prev;
 
     BufferDescExtra *extra;
 
@@ -240,8 +240,10 @@ typedef struct BufferDesc {
 } BufferDesc;
 
 #define LIST_CAPACITY 150000
-#define HOT_CAPACITY 150000
-#define HISTORY_MAXLEN 50000
+#define HOT_CAPACITY 10000
+#define HISTORY_MAXLEN 5000
+#define HISTORY_LISTLEN (HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS)
+#define LEVEL_NUM 8
 /*
  * Concurrent access to buffer headers has proven to be more efficient if
  * they're cache line aligned. So we force the start of the BufferDescriptors
@@ -355,6 +357,7 @@ extern BufferDesc *StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32 *
 extern void DeleteBufFromList(BufferDesc *buf);
 extern void BufferAdmit(BufferDesc *buf);
 extern void HitBuffer(int buf_id);
+extern void InsertIntoColdList(BufferDesc *buf);
 
 extern void StrategyFreeBuffer(volatile BufferDesc* buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc* buf);
