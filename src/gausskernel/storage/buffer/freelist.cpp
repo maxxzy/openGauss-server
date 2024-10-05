@@ -246,7 +246,7 @@ void BufHistoryDelete(BufferTag *tag, uint32 hashcode)
     result = (BufHistoryHitcount *)buf_hash_operate<HASH_REMOVE>(t_thrd.storage_cxt.StrategyControl->history_hitcount_map, tag, hashcode, NULL);
 
     if (result == NULL) { /* shouldn't happen */
-        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), (errmsg("buffer history table corrupted."))));
+        ereport(LOG, (errcode(ERRCODE_DATA_CORRUPTED), (errmsg("buffer history has been deleted"))));
     }
 }
 
@@ -389,13 +389,13 @@ void compaction() {
 retry:
     buf = Controller->hot_head;
     ereport(LOG, (errmsg("compaction bottom = %d, demote_cnt = %d", bottom, demote_cnt)));
-    while(buf != NULL) {
+    while(buf != NULL && demote_cnt < HOT_CAPACITY / 2) {
         //ereport(LOG, (errmsg("compaction check buf_id = %d, buf_type = %d, buf_hitcount = %d", buf->buf_id, buf->buftype, buf->hitcount)));
 
-        local_buf_state = LockBufHdr(buf);
         next_buf = buf->next;
         if (buf->hitcount == bottom) {
             //ereport(LOG, (errmsg("buf_id = %d need compaction, buf_hitcount = %d", buf->buf_id, buf->hitcount)));
+            local_buf_state = LockBufHdr(buf);
 
             HotListDeleteBuf(buf);
             ColdListPushBack(buf);
@@ -404,11 +404,11 @@ retry:
             buf->hitcount = 1;
             if_demote = true;
             demote_cnt++;
+            UnlockBufHdr(buf, local_buf_state);
         }
-        UnlockBufHdr(buf, local_buf_state);
         buf = next_buf;
     }
-    if (!if_demote && demote_cnt < HOT_CAPACITY / 4) {
+    if (!if_demote || demote_cnt < HOT_CAPACITY / 4) {
         bottom = (bottom + 1) % LEVEL_NUM;
         goto retry;
     }
@@ -516,7 +516,8 @@ void HitBuffer(int buf_id){
  * @author: xzy
  */
 void BufferAdmit(BufferDesc *buf) {
-    ereport(LOG, (errmsg("BufferAdmit, buf_id = %d", buf->buf_id)));
+    ereport(LOG, (errmsg("BufferAdmit, buf_id = %d, buf_tag, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
+                         buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, buf->tag.blockNum, buf->tag.forkNum)));
     if (buf->buftype != BufferType::NONE) {
         ereport(WARNING, (errmsg("buffertype is not none when buffer admit, buf_id = %d", buf->buf_id)));
         return;
@@ -732,7 +733,11 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
 
-    buf = Controller->cold_head;
+    if (Controller->cold_size != 0) {
+        buf = Controller->cold_head;
+    } else {
+        buf = Controller->hot_head;
+    }
     while (buf != NULL) {
         ereport(LOG, (errmsg("get buf_id %d", buf->buf_id)));
 

@@ -2703,6 +2703,8 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
     /* create a tag so we can lookup the buffer */
     INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
 
+    ereport(LOG, (errmsg("BufferAlloc lookup buf_tag, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
+                         new_tag.rnode.spcNode, new_tag.rnode.dbNode, new_tag.rnode.relNode, new_tag.blockNum, new_tag.forkNum)));
     /* determine its hash code and partition lock ID */
     new_hash = BufTableHashCode(&new_tag);
     new_partition_lock = BufMappingPartitionLock(new_hash);
