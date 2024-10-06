@@ -26,6 +26,9 @@
 #include "utils/atomic.h"
 #include "access/xlogdefs.h"
 #include <list>
+#include <vector>
+#include <cmath>
+#include <functional>
 
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
@@ -238,6 +241,178 @@ typedef struct BufferDesc {
     volatile uint64 lsn_dirty;
 #endif
 } BufferDesc;
+
+
+static const uint8_t n_edc_feature = 10;
+// static const uint max_n_extra_feature = 4;
+static const uint32_t n_extra_fields = 0;
+static const uint8_t max_n_past_timestamps = 32;
+static const uint8_t max_n_past_distances = 31;
+static const uint8_t base_edc_window = 10;
+static const uint32_t batch_size = 131072;
+
+/**
+ * @description: MetaData用于存储数据访问信息，用于给模型预测或训练
+ * @use:
+ * @author: zya
+ */
+class MetaData {
+    public:
+        uint32_t past_distance[max_n_past_timestamps];
+        float _edc[n_edc_feature];
+        uint8_t num_access;
+        uint64_t last_access;
+        uint8_t dis_idx;
+        std::vector<uint64_t> sample_time;
+        // std::vector<uint64_t> access_time;
+        
+    MetaData(uint64_t req_time) : last_access(req_time), dis_idx(0), num_access(1) {
+        for(int i = 0;i < max_n_past_timestamps;i++) {
+            past_distance[i] = 0;
+        }
+        for(int i = 0; i < n_edc_feature; i++) {
+            _edc[i] = 1.0;
+        }
+    }
+
+    void update(const uint64_t &req_time,
+        uint32_t max_hash_edc_idx,
+        std::vector<uint32_t> &edc_windows,
+        const std::vector<double> &hash_edc) {
+        uint32_t distance = (uint32_t)(req_time - last_access);
+        if(req_time > last_access) {
+            past_distance[dis_idx++] = distance;
+            last_access = req_time;
+        } else {
+            distance = -distance;
+            past_distance[dis_idx++] = distance;
+        }
+        // print();
+        num_access++;
+        if(dis_idx == max_n_past_timestamps) {
+            dis_idx = 0;
+        }
+        for (uint8_t i = 0; i < n_edc_feature; ++i) {
+            uint32_t _distance_idx = std::min(uint32_t(distance / edc_windows[i]), max_hash_edc_idx);
+            _edc[i] = _edc[i] * hash_edc[_distance_idx] + 1;
+        }
+        // print();
+        return;
+    }
+
+    void update_evict (uint64_t evict_access) {
+        sample_time.emplace_back(evict_access);
+    }
+};
+
+
+/**
+ * @description: TrainData用于存储积累的打好标签的训练数据，用于后续训练
+ * @use:
+ * @author: zya
+ */
+class TrainData {
+  public:
+    std::vector<float> labels;
+    std::vector<int32_t> indptr;
+    std::vector<int32_t> indices;
+    std::vector<double> data;
+    uint32_t memory_window;
+    bool use_edc;
+    uint32_t size_;
+
+    TrainData(uint32_t n_feature, uint32_t memory_window_, bool edc_avaliable) {
+        labels.reserve(batch_size);
+        indptr.reserve(batch_size + 1);
+        indptr.emplace_back(0);
+        indices.reserve(batch_size * n_feature);
+        data.reserve(batch_size * n_feature);
+        memory_window = memory_window_;
+        use_edc = edc_avaliable;
+        size_ = 0;
+    }
+
+    std::vector<double> calculate_edc();
+
+    void emplace_back(MetaData meta, uint64_t sample_time, uint32_t future_interval,
+        uint32_t max_hash_edc_idx, std::vector<uint32_t> &edc_windows, std::vector<double> &hash_edc, bool debug = false) {
+        int32_t counter = indptr.back();
+        // if(debug) {
+        //   cout << "Training data insert" << endl;
+        //   meta.print();
+        // }
+        size_++;
+        indices.emplace_back(0);
+        data.emplace_back(sample_time - meta.last_access);
+        ++counter;
+
+        uint32_t this_past_distance = 0;
+        int j = 0;
+        uint8_t n_within = 0;
+        // if(debug) {
+        //   cout << "Insert distance" << endl;
+        // }
+        for (; j < meta.dis_idx && j < max_n_past_distances; ++j) {
+            uint8_t past_distance_idx = (meta.dis_idx - 1 - j) % max_n_past_distances;
+            const uint32_t past_distance = meta.past_distance[past_distance_idx];
+            // if(debug) {
+            //   cout << past_distance << " " << (double)(past_distance) << " ";
+            // }
+            this_past_distance += past_distance;
+            indices.emplace_back(j + 1);
+            data.emplace_back(past_distance);
+            if (this_past_distance < memory_window) {
+                ++n_within;
+            }
+        }
+        // if(debug) {
+        //   cout << endl;
+        // }
+
+        counter += j;
+
+        // if(debug) {
+        //   cout << "N_within param is: " << n_within << " " << (double)(n_within) << endl;
+        // }
+        indices.push_back(max_n_past_timestamps);
+        data.push_back(n_within);
+        ++counter;
+
+        indices.push_back(max_n_past_timestamps + 1);
+        // cout << "Num of access param is: " << meta.num_access << " " << (double)(meta.num_access) << endl;
+        data.push_back(meta.num_access);
+        ++counter;
+
+
+        if (use_edc) {
+            
+            for (int k = 0; k < n_edc_feature; ++k) {
+                indices.push_back(max_n_past_timestamps + n_extra_fields + 2 + k);
+                uint32_t _distance_idx = std::min(
+                        uint32_t(sample_time - meta.last_access) / edc_windows[k],
+                        max_hash_edc_idx);
+                data.push_back(meta._edc[k] * hash_edc[_distance_idx]);
+            }
+            counter += n_edc_feature;
+        }
+        // if(debug) {
+        //   cout << "future distance: " << future_interval << " and log version: " << log1p(future_interval) << endl;
+        // }
+        labels.push_back(log1p(future_interval));
+        indptr.push_back(counter);
+        // cout << "Finish" << endl;
+    }
+
+    void clear() {
+        labels.clear();
+        indptr.resize(1);
+        indices.clear();
+        data.clear();
+        size_ = 0;
+    }
+
+};
+
 
 #define LIST_CAPACITY 150000
 #define HOT_CAPACITY 10000

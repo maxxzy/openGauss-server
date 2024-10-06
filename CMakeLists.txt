@@ -106,6 +106,14 @@ install(DIRECTORY ${CMAKE_BINARY_DIR}/proc_srclib DESTINATION lib/postgresql)
 install(DIRECTORY ${CMAKE_BINARY_DIR}/pg_plugin DESTINATION lib/postgresql)
 install(DIRECTORY ${CMAKE_BINARY_DIR}/libsimsearch DESTINATION lib)
 
+set(LIBS -lm -l_lightgbm)
+
+link_directories(/home/zya/zya/usr/local/lib/lib)
+
+find_package(LightGBM PATHS /usr/local/lib)
+
+target_link_libraries(openGauss ${LIBS})
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/contrib/dolphin)
     install(CODE "execute_process(COMMAND bash cmake.sh WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/contrib/dolphin)")
     install(FILES ${CMAKE_SOURCE_DIR}/contrib/dolphin/dolphin.control

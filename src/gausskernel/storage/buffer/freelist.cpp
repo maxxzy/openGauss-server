@@ -31,6 +31,8 @@
 #include "pgstat.h"
 #include <unordered_map>
 #include <list>
+#include <string>
+#include <LightGBM/c_api.h>
 #include "utils/dynahash.h"
 
 #define INT_ACCESS_ONCE(var) ((int)(*((volatile int *)&(var))))
@@ -64,6 +66,11 @@ typedef struct BufferStrategyControl {
 
     pg_atomic_uint32 firstVictimBuffer;
 
+    /* 
+     * This atomic variable is used for record the access time stamp to compute the distance in metadata
+     */
+    pg_atomic_uint64 requestTime;
+
     int cold_size;
     slock_t cold_list_lock;
 
@@ -88,6 +95,32 @@ typedef struct BufferStrategyControl {
     bool in_compaction;
     slock_t compaction_lock;
     bool if_get_from_free;
+
+
+    // Model parameters
+    std::vector<uint32_t> edc_windows;
+    std::vector<double> hash_edc;
+    uint32_t max_hash_edc_idx;
+    uint32_t memory_window;
+    BoosterHandle booster;
+    bool is_trained;
+
+    const int num_candidate = 4;
+
+    std::unordered_map<std::string, std::string> training_params = {
+        //don't use alias here. C api may not recognize
+        {"boosting",         "gbdt"},
+        {"objective",        "regression"},
+        {"num_iterations",   "32"},
+        {"num_leaves",       "32"},
+        {"num_threads",      "1"},
+        {"feature_fraction", "0.8"},
+        {"bagging_freq",     "5"},
+        {"bagging_fraction", "0.8"},
+        {"learning_rate",    "0.1"},
+        {"verbosity",        "0"},
+        {"force_row_wise", "true"},
+    };
 } BufferStrategyControl;
 
 typedef struct {
