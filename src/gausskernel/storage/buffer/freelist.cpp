@@ -741,6 +741,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
 
     /* Check the Candidate list */
+    /*
     if (ENABLE_INCRE_CKPT && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 1) {
         if (NEED_CONSIDER_USECOUNT) {
             const uint32 MAX_RETRY_SCAN_CANDIDATE_LISTS = 5;
@@ -770,10 +771,11 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             }
         }
     }
+    */
 
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     int buf_id = pg_atomic_read_u32(&Controller->firstVictimBuffer);
-    if (buf_id < LIST_CAPACITY && !Controller->if_get_from_free) {
+    if (buf_id < NORMAL_SHARED_BUFFER_NUM) {
         ereport(LOG, (errmsg("get next victim buffer without algorithm, buf_id = %d", buf_id)));
         buf = GetBufferDescriptor(buf_id);
         local_buf_state = LockBufHdr(buf);
@@ -796,12 +798,14 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
     //ereport(LOG, (errmsg("cold list lock get !!!!")));
-
+    buf = Controller->cold_head;
+    /*
     if (Controller->cold_size != 0) {
         buf = Controller->cold_head;
     } else {
         buf = Controller->hot_head;
     }
+    */
     while (buf != NULL) {
         //ereport(LOG, (errmsg("get buf_id %d", buf->buf_id)));
 
