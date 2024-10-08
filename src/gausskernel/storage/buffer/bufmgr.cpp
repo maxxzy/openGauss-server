@@ -3028,7 +3028,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             buf->hitcount = 1;
         } else {
             DeleteBufFromList(buf);
-            //ereport(LOG, (errmsg("delete successfully buf_id = %d", buf->buf_id)));
+            ereport(LOG, (errmsg("delete successfully buf_id = %d", buf->buf_id)));
         }
     }
     ((BufferDesc *)buf)->tag = new_tag;

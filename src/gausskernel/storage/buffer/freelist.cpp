@@ -301,10 +301,8 @@ void ColdListPushBack(BufferDesc *buf) {
     }
     Controller->cold_tail = buf;
     Controller->cold_size++;
-    /*
     ereport(LOG, (errmsg("coldlist push back, buf_id = %d, cold_size = %d, head_id = %d, tail_id = %d", 
                          buf->buf_id, Controller->cold_size, Controller->cold_head->buf_id, Controller->cold_tail->buf_id)));
-    */
 }
 
 void ColdListDeleteBuf(BufferDesc *buf) {
@@ -328,7 +326,6 @@ void ColdListDeleteBuf(BufferDesc *buf) {
     buf->prev = NULL;
     buf->next = NULL;
     Controller->cold_size--;
-    /*
     ereport(LOG, (errmsg("coldlist delete buf, buf_id = %d", buf->buf_id)));
     if (Controller->cold_size != 0) {
         ereport(LOG, (errmsg("coldlist delete buf, cold_size = %d, head_id = %d, tail_id = %d", 
@@ -336,7 +333,6 @@ void ColdListDeleteBuf(BufferDesc *buf) {
     } else {
         ereport(LOG, (errmsg("coldlist delete buf, now is empty")));
     }
-    */
 }
 
 void HotListPushBack(BufferDesc *buf) {
@@ -349,10 +345,8 @@ void HotListPushBack(BufferDesc *buf) {
     }
     Controller->hot_tail = buf;
     Controller->hot_size++;
-    /*
     ereport(LOG, (errmsg("hotlist push back, buf_id = %d, cold_size = %d, head_id = %d, tail_id = %d", 
                          buf->buf_id, Controller->hot_size, Controller->hot_head->buf_id, Controller->hot_tail->buf_id)));
-    */
 }
 
 void HotListDeleteBuf(BufferDesc *buf) {
@@ -372,7 +366,6 @@ void HotListDeleteBuf(BufferDesc *buf) {
     buf->prev = NULL;
     buf->next = NULL;
     Controller->hot_size--;
-    /*
     ereport(LOG, (errmsg("hotlist delete buf, buf_id = %d", buf->buf_id)));
     if (Controller->hot_size != 0) {
         ereport(LOG, (errmsg("hotlist delete buf, hot_size = %d, head_id = %d, tail_id = %d", 
@@ -380,7 +373,6 @@ void HotListDeleteBuf(BufferDesc *buf) {
     } else {
         ereport(LOG, (errmsg("hotlist delete buf, now is empty")));
     }
-    */
 }
 
 /**
@@ -516,7 +508,7 @@ void HitBuffer(int buf_id){
 
     uint32 local_buf_state = 0;
     buf = GetBufferDescriptor(buf_id);
-    //ereport(LOG, (errmsg("HitBuffer buf_id = %d, buf_type = %d", buf_id, buf->buftype)));
+    ereport(LOG, (errmsg("HitBuffer buf_id = %d, buf_type = %d", buf_id, buf->buftype)));
 
     local_buf_state = LockBufHdr(buf);
 
@@ -571,10 +563,8 @@ void HitBuffer(int buf_id){
  * @author: xzy
  */
 void BufferAdmit(BufferDesc *buf) {
-    /*
     ereport(LOG, (errmsg("BufferAdmit, buf_id = %d, buf_tag, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
                          buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, buf->tag.blockNum, buf->tag.forkNum)));
-    */
     if (buf->buftype != BufferType::NONE) {
         ereport(WARNING, (errmsg("buffertype is not none when buffer admit, buf_id = %d", buf->buf_id)));
         return;
@@ -634,7 +624,7 @@ void BufferAdmit(BufferDesc *buf) {
 
 void DeleteBufFromList(BufferDesc *buf) {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
-    //ereport(LOG, (errmsg("delete from list buf_id = %d, buf_buftype = %d", buf->buf_id, buf->buftype)));
+    ereport(LOG, (errmsg("delete from list buf_id = %d, buf_buftype = %d", buf->buf_id, buf->buftype)));
     if (buf->buftype == BufferType::Cold) {
         SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         //ereport(LOG, (errmsg("cold list lock get !!!!")));
@@ -741,7 +731,6 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
     (void)pg_atomic_fetch_add_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 1);
 
     /* Check the Candidate list */
-    /*
     if (ENABLE_INCRE_CKPT && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 1) {
         if (NEED_CONSIDER_USECOUNT) {
             const uint32 MAX_RETRY_SCAN_CANDIDATE_LISTS = 5;
@@ -752,6 +741,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             while (retry_times < MAX_RETRY_SCAN_CANDIDATE_LISTS) {
                 buf = get_buf_from_candidate_list(strategy, buf_state);
                 if (buf != NULL) {
+                    buf->first_get_from_free = false;
                     (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
                     ereport(LOG, (errmsg("get buffer from freelist buf_id = %d", buf->buf_id)));
                     t_thrd.storage_cxt.StrategyControl->if_get_from_free = true;
@@ -764,6 +754,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         } else {
             buf = get_buf_from_candidate_list(strategy, buf_state);
             if (buf != NULL) {
+                buf->first_get_from_free = false;
                 (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
                 ereport(LOG, (errmsg("get buffer from freelist buf_id = %d", buf->buf_id)));
                 t_thrd.storage_cxt.StrategyControl->if_get_from_free = true;
@@ -771,11 +762,10 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             }
         }
     }
-    */
 
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     int buf_id = pg_atomic_read_u32(&Controller->firstVictimBuffer);
-    if (buf_id < NORMAL_SHARED_BUFFER_NUM) {
+    if (buf_id < NORMAL_SHARED_BUFFER_NUM && !Controller->if_get_from_free) {
         ereport(LOG, (errmsg("get next victim buffer without algorithm, buf_id = %d", buf_id)));
         buf = GetBufferDescriptor(buf_id);
         local_buf_state = LockBufHdr(buf);
@@ -811,8 +801,9 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
 
         if (!retryLockBufHdr(buf, &local_buf_state)) {
             if (--try_get_lock_times == 0) {
-                ereport(WARNING, (errmsg("try get buf headr lock times equal to cold_size when StrategyGetBuffer")));
+                ereport(WARNING, (errmsg("try get buf_id = %d headr lock times equal to cold_size, try next", buf->buf_id)));
                 try_get_lock_times = max_buffer_can_use;
+                buf = buf->next;
             }
             perform_delay(&retry_lock_status);
             continue;
@@ -822,7 +813,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
 
-            ereport(LOG, (errmsg("find an available buffer, buf_id = %d", buf_id)));
+            ereport(LOG, (errmsg("find an available buffer, buf_id = %d", buf->buf_id)));
             if (strategy != NULL) {
                 AddBufferToRing(strategy, buf);
                 DeleteBufFromList(buf);
@@ -1172,6 +1163,7 @@ void StrategyInitialize(bool init)
             buf->hitcount = 0;
             buf->next = NULL;
             buf->prev = NULL;
+            buf->first_get_from_free = true;
         }
 
         HASHCTL info;
@@ -1472,7 +1464,8 @@ static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, ui
 
             if (g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id]) {
                 g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] = false;
-                enable_available = BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) && !(buf->buftype == BufferType::Hot);
+                enable_available = BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
+                        !(buf->buftype == BufferType::Hot) && buf->first_get_from_free;
                 need_push_dirst_list = need_scan_dirty && dirty_list_num < CANDIDATE_DIRTY_LIST_LEN &&
                         free_space_enough(buf_id);
                 if (enable_available) {
@@ -1507,7 +1500,7 @@ static BufferDesc* get_buf_from_candidate_list(BufferAccessStrategy strategy, ui
             buf = GetBufferDescriptor(buf_id);
             local_buf_state = LockBufHdr(buf);
             enable_available = (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0) && !(local_buf_state & BM_IS_META)
-                && free_space_enough(buf_id) && !(buf->buftype == BufferType::Hot);
+                && free_space_enough(buf_id) && !(buf->buftype == BufferType::Hot) && buf->first_get_from_free;
             if (enable_available) {
                 if (strategy != NULL) {
                     AddBufferToRing(strategy, buf);

@@ -232,6 +232,8 @@ typedef struct BufferDesc {
     BufferDesc* next;
     BufferDesc* prev;
 
+    bool first_get_from_free;
+
     BufferDescExtra *extra;
 
 #ifdef USE_ASSERT_CHECKING
