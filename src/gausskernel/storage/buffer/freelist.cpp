@@ -821,7 +821,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
 
-            ereport(LOG, (errmsg("find an available buffer, buf_id = %d", buf_id)));
+            ereport(LOG, (errmsg("find an available buffer, buf_id = %d", buf->buf_id)));
             if (strategy != NULL) {
                 AddBufferToRing(strategy, buf);
                 DeleteBufFromList(buf);
