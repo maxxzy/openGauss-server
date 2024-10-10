@@ -98,12 +98,26 @@ typedef struct BufferStrategyControl {
 
 
     // Model parameters
-    std::vector<uint32_t> edc_windows;
-    std::vector<double> hash_edc;
+    uint8_t n_feature;
+    uint32_t edc_windows[n_edc_feature];
+    double hash_edc[n_edc_feature];
     uint32_t max_hash_edc_idx;
     uint32_t memory_window;
+    slock_t model_lock;
     BoosterHandle booster;
+    bool is_training;
     bool is_trained;
+
+    // Train Data
+    slock_t data_lock;
+    TrainData *training_data;
+    TrainData *intrain_data;
+    uint32 data_num;
+    const uint32 batch_num = 131072;
+
+    // MetaData
+    // MetaData in_cache_meta[LIST_CAPACITY];
+    MetaData out_cache_meta[HISTORY_LISTLEN];
 
     const int num_candidate = 4;
 
@@ -227,6 +241,159 @@ static inline uint32 ClockSweepTick(int max_nbuffer_can_use)
         }
     }
     return victim;
+}
+
+/**
+ * @description:当积累训练数据达到阈值时调用，对模型进行训练
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void ModelTrain() {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    DatasetHandle trainData;
+    LGBM_DatasetCreateFromCSR(
+            static_cast<void *>(Controller->intrain_data->indptr.data()),
+            C_API_DTYPE_INT32,
+            Controller->intrain_data->indices.data(),
+            static_cast<void *>(Controller->intrain_data->data.data()),
+            C_API_DTYPE_FLOAT64,
+            Controller->intrain_data->indptr.size
+            (),
+            Controller->intrain_data->data.size(),
+            Controller->n_feature,  //remove future t
+            std::map_to_string(Controller->training_params).c_str(),
+            nullptr,
+            &trainData);
+
+    LGBM_DatasetSetField(trainData,
+                            "label",
+                            static_cast<void *>(Controller->intrain_data->labels.data()),
+                            Controller->intrain_data->labels.size(),
+                            C_API_DTYPE_FLOAT32);
+
+    // init booster
+    SpinLockAcquire(&Controller->model_lock);
+    if (Controller->booster) LGBM_BoosterFree(Controller->booster);
+    LGBM_BoosterCreate(trainData, std::map_to_string(Controller->training_params).c_str(), &Controller->booster);
+    // train
+    for (int i = 0; i < std::stoi(Controller->training_params["num_iterations"]); i++) {
+        int isFinished;
+        LGBM_BoosterUpdateOneIter(Controller->booster, &isFinished);
+        if (isFinished) {
+            break;
+        }
+    }
+    SpinLockRelease(&Controller->model_lock);
+
+    int64_t len;
+    std::vector<double> result(Controller->intrain_data->indptr.size() - 1);
+    LGBM_BoosterPredictForCSR(Controller->booster,
+                                static_cast<void *>(Controller->intrain_data->indptr.data()),
+                                C_API_DTYPE_INT32,
+                                Controller->intrain_data->indices.data(),
+                                static_cast<void *>(Controller->intrain_data->data.data()),
+                                C_API_DTYPE_FLOAT64,
+                                Controller->intrain_data->indptr.size(),
+                                Controller->intrain_data->data.size(),
+                                Controller->n_feature,  //remove future t
+                                C_API_PREDICT_NORMAL,
+                                0,
+                                atoi(Controller->training_params["num_iterations"].c_str()),
+                                std::map_to_string(Controller->training_params).c_str(),
+                                &len,
+                                result.data());
+
+    double se = 0;
+    for (int i = 0; i < result.size(); ++i) {
+        auto diff = result[i] - Controller->intrain_data->labels[i];
+        se += diff * diff;
+    }
+
+    ereport(LOG,(errmsg("The loss in this train is: %f",se)));
+
+
+    Controller->intrain_data->clear();
+
+}
+
+/**
+ * @description:找到History中Buftag对应的metadata对应的索引，为后续操作使用
+ * @return {Metadata对应的offset}
+ * @use:
+ * @author: zya
+ */
+int GetHistoryMetaIndex(BufferTag *tag) {
+
+}
+
+
+
+/**
+ * @description:更新Buftag对应的特征信息
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void UpdateMeta(BufferDesc *buf, uint64_t access_time) {
+    // TODO: Decide whether lock the buf header
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    buf->meta.update(access_time, Controller->max_hash_edc_idx, Controller->edc_windows, Controller->hash_edc);
+}
+
+
+/**
+ * @description:检查是否可以加入训练数据，若有数据可插入则将数据插入
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void InsertTrainData(BufferDesc *buf, uint64_t future_access) {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    if(buf->meta.sample_size > 0) {
+        SpinLockAcquire(&Controller->data_lock);
+        while(buf->meta.sample_size > 0) {
+            if(Controller->data_num < Controller->batch_num) {
+                Controller->training_data->emplace_back(buf->meta, buf->meta.sample_time[buf->meta.sample_idx], future_access, Controller->max_hash_edc_idx, Controller->edc_windows, Controller->hash_edc);
+                // Reset the sample array after insert training data
+                buf->meta.sample_time[buf->meta.sample_idx] = 0;
+                if(buf->meta.sample_idx == 0) {
+                    buf->meta.sample_idx = max_n_sample_time - 1;
+                } else {
+                    buf->meta.sample_idx--;
+                }
+            }
+        }
+        buf->meta.sample_idx = 0;
+        // Make sure all sample time are reset
+        for(int i = 0;i < max_n_sample_time; i++) {
+            buf->meta.sample_time[i] = 0;
+        }
+        SpinLockRelease(&Controller->data_lock);
+    }
+}
+
+void CheckAndTrain() {
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    SpinLockAcquire(&Controller->data_lock);
+    if(Controller->data_num >= Controller->batch_num) {
+        // TODO: Swap the train data and intrain data (Notice: need clear data num)
+        if(!Controller->is_training) {
+            ModelTrain();
+        }
+    }
+}
+
+/**
+ * @description:对Buftag进行采样
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void SampleBuffer(BufferDesc *buf, uint64_t access_time) {
+    // auto Controller = t_thrd.storage_cxt.StrategyControl;
+    buf->meta.update_evict(access_time);
+
 }
 
 int BufHistoryLookup(BufferTag *tag, uint32 hashcode)
@@ -502,6 +669,10 @@ void HitBuffer(int buf_id){
     buf = GetBufferDescriptor(buf_id);
 
     local_buf_state = LockBufHdr(buf);
+    uint64 access_time = pg_atomic_fetch_add_u64(&Controller->requestTime, 1);
+    InsertTrainData(buf, access_time);
+    CheckAndTrain();
+    UpdateMeta(buf, access_time);
 
     if (buf->buftype == BufferType::Cold) {
         if (check_compaction()) {

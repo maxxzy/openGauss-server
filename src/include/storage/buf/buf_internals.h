@@ -230,6 +230,8 @@ typedef struct BufferDesc {
 
     uint32 buftype;
 
+    MetaData meta;
+
     uint32 hitcount;
 
     BufferDesc* next;
@@ -250,20 +252,23 @@ static const uint8_t max_n_past_timestamps = 32;
 static const uint8_t max_n_past_distances = 31;
 static const uint8_t base_edc_window = 10;
 static const uint32_t batch_size = 131072;
+static const uint8_t max_n_sample_time = 4;
 
 /**
  * @description: MetaData用于存储数据访问信息，用于给模型预测或训练
  * @use:
  * @author: zya
  */
-class MetaData {
+typedef struct MetaData {
     public:
         uint32_t past_distance[max_n_past_timestamps];
         float _edc[n_edc_feature];
         uint8_t num_access;
         uint64_t last_access;
         uint8_t dis_idx;
-        std::vector<uint64_t> sample_time;
+        uint64_t sample_time[max_n_sample_time];
+        uint8_t sample_idx;
+        uint8_t sample_size;
         // std::vector<uint64_t> access_time;
         
     MetaData(uint64_t req_time) : last_access(req_time), dis_idx(0), num_access(1) {
@@ -273,12 +278,15 @@ class MetaData {
         for(int i = 0; i < n_edc_feature; i++) {
             _edc[i] = 1.0;
         }
+        for(int i = 0;i < max_n_sample_time; i++) {
+            sample_time[i] = 0;
+        }
     }
 
     void update(const uint64_t &req_time,
         uint32_t max_hash_edc_idx,
-        std::vector<uint32_t> &edc_windows,
-        const std::vector<double> &hash_edc) {
+        uint32_t* edc_windows,
+        double* hash_edc) {
         uint32_t distance = (uint32_t)(req_time - last_access);
         if(req_time > last_access) {
             past_distance[dis_idx++] = distance;
@@ -301,9 +309,12 @@ class MetaData {
     }
 
     void update_evict (uint64_t evict_access) {
-        sample_time.emplace_back(evict_access);
+        sample_time[sample_idx++] = evict_access;
+        if(sample_idx == max_n_sample_time) {
+            sample_idx = 0;
+        }
     }
-};
+} MetaData;
 
 
 /**
@@ -335,7 +346,7 @@ class TrainData {
     std::vector<double> calculate_edc();
 
     void emplace_back(MetaData meta, uint64_t sample_time, uint32_t future_interval,
-        uint32_t max_hash_edc_idx, std::vector<uint32_t> &edc_windows, std::vector<double> &hash_edc, bool debug = false) {
+        uint32_t max_hash_edc_idx, uint32_t* edc_windows, double* hash_edc, bool debug = false) {
         int32_t counter = indptr.back();
         // if(debug) {
         //   cout << "Training data insert" << endl;
