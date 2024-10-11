@@ -645,6 +645,7 @@ void CheckHistoryListSize() {
         uint32 hashcode = BufTableHashCode(&buf_tag);
         BufHistoryDelete(&buf_tag, hashcode);
         Controller->history_list[Controller->history_head] = {};
+        Controller->out_cache_meta[Controller->history_head] = {};
         Controller->history_head = (Controller->history_head + 1) % HISTORY_LISTLEN;
         Controller->history_size--;
         ereport(LOG, (errmsg("pop from history, history head = %d", Controller->history_head)));
@@ -745,15 +746,19 @@ void BufferAdmit(BufferDesc *buf) {
     auto list_index = HistoryIndexLookup(&buf->tag, hashcode);
     Controller->history_size--;
     Controller->history_list[list_index] = {};
+    // Reinsert the metadata to the buffer descripter
+    buf->meta = Controller->out_cache_meta[list_index];
     BufHistoryDelete(&buf->tag, hashcode);
     int i = list_index;
     while (i != Controller->history_tail) {
         uint32 current_hash = BufTableHashCode(&Controller->history_list[(i + 1) % HISTORY_LISTLEN]);
         UpdateHistoryIndex(&Controller->history_list[(i + 1) % HISTORY_LISTLEN], current_hash, i);
         Controller->history_list[i] = Controller->history_list[(i + 1) % HISTORY_LISTLEN];
+        Controller->out_cache_meta[i] = Controller->out_cache_meta[(i + 1) % HISTORY_LISTLEN];
         i = (i + 1) % HISTORY_LISTLEN;
     }
     Controller->history_list[i] = {};
+    Controller->out_cache_meta[i] = {};
     PrevIndex(&Controller->history_tail, HISTORY_LISTLEN);
     ereport(LOG, (errmsg("get buf from history, hitcount = %d, history size = %d, history tail = %d", history_hitcount, Controller->history_size, Controller->history_tail)));
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
@@ -791,6 +796,7 @@ void DeleteBufFromList(BufferDesc *buf) {
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     Controller->history_tail = (Controller->history_tail + 1) % HISTORY_LISTLEN;
     Controller->history_list[Controller->history_tail] = buf->tag;
+    Controller->out_cache_meta[Controller->history_tail] = buf->meta;
     Controller->history_size++;
     ereport(LOG, (errmsg("insert into history history_size = %d, history_tail = %d", Controller->history_size, Controller->history_tail)));
     uint32 hashcode = BufTableHashCode(&buf->tag);

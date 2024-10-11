@@ -271,7 +271,7 @@ typedef struct MetaData {
         uint8_t sample_size;
         // std::vector<uint64_t> access_time;
         
-    MetaData(uint64_t req_time) : last_access(req_time), dis_idx(0), num_access(1) {
+    MetaData() : last_access(0), dis_idx(0), num_access(1) {
         for(int i = 0;i < max_n_past_timestamps;i++) {
             past_distance[i] = 0;
         }
@@ -281,6 +281,10 @@ typedef struct MetaData {
         for(int i = 0;i < max_n_sample_time; i++) {
             sample_time[i] = 0;
         }
+    }
+
+    void init(uint64 access_time) {
+        last_access = access_time;
     }
 
     void update(const uint64_t &req_time,
