@@ -2297,7 +2297,7 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
          * not currently in memory.
          */
         bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum, strategy, &found, pblk);
-        ereport(LOG, (errmsg("ReadBuffer_common get a buffer, buf_id = %d", bufHdr->buf_id)));
+        //ereport(LOG, (errmsg("ReadBuffer_common get a buffer, buf_id = %d", bufHdr->buf_id)));
         if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
             bufHdr->extra->encrypt = smgr->encrypt ? true : false; /* set tde flag */
         }
@@ -2702,8 +2702,10 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
 
     /* create a tag so we can lookup the buffer */
     INIT_BUFFERTAG(new_tag, smgr->smgr_rnode.node, fork_num, block_num);
+    /*
     ereport(LOG, (errmsg("BufferAlloc lookup buf_tag, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
                          new_tag.rnode.spcNode, new_tag.rnode.dbNode, new_tag.rnode.relNode, new_tag.blockNum, new_tag.forkNum)));
+    */
     /* determine its hash code and partition lock ID */
     new_hash = BufTableHashCode(&new_tag);
     new_partition_lock = BufMappingPartitionLock(new_hash);
@@ -2776,6 +2778,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
          */
         pgstat_report_waitevent(WAIT_EVENT_BUF_STRATEGY_GET);
         buf = (BufferDesc *)StrategyGetBuffer_new(strategy, &buf_state);
+        //ereport(LOG, (errmsg("strategy return a buffer buf_id = %d, buf_type = %d", buf->buf_id, buf->buftype)));
         pgstat_report_waitevent(WAIT_EVENT_END);
 
         Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
@@ -2789,6 +2792,11 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         if (!SSHelpFlushBufferIfNeed(buf)) {
             // for dms this page cannot eliminate, get another one 
             UnpinBuffer(buf, true);
+            if (buf->buftype == BufferType::Cold) {
+                RefreshColdBuf(buf);
+            } else if (buf->buftype == BufferType::NONE) {
+                buf->first_get_from_free = true;
+            }
             continue;
         }
 
@@ -2805,6 +2813,11 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             if (!backend_can_flush_dirty_page()) {
                 UnpinBuffer(buf, true);
                 (void)sched_yield();
+                if (buf->buftype == BufferType::Cold) {
+                    RefreshColdBuf(buf);
+                } else if (buf->buftype == BufferType::NONE) {
+                    buf->first_get_from_free = true;
+                }
                 continue;
             }
 
@@ -2850,6 +2863,11 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
                         /* Drop lock/pin and loop around for another buffer */
                         LWLockRelease(buf->content_lock);
                         UnpinBuffer(buf, true);
+                        if (buf->buftype == BufferType::Cold) {
+                            RefreshColdBuf(buf);
+                        } else if (buf->buftype == BufferType::NONE) {
+                            buf->first_get_from_free = true;
+                        }
                         continue;
                     }
                 }
@@ -2863,6 +2881,11 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
                     if (!free_space_enough(buf->buf_id)) {
                         LWLockRelease(buf->content_lock);
                         UnpinBuffer(buf, true);
+                        if (buf->buftype == BufferType::Cold) {
+                            RefreshColdBuf(buf);
+                        } else if (buf->buftype == BufferType::NONE) {
+                            buf->first_get_from_free = true;
+                        }
                         continue;
                     }
                     uint32 pos = 0;
@@ -3004,6 +3027,11 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         }
         LWLockRelease(new_partition_lock);
         UnpinBuffer(buf, true);
+        if (buf->buftype == BufferType::Cold) {
+            RefreshColdBuf(buf);
+        } else if (buf->buftype == BufferType::NONE) {
+            buf->first_get_from_free = true;
+        }
     }
     
 #ifdef USE_ASSERT_CHECKING
@@ -3028,7 +3056,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             buf->hitcount = 1;
         } else {
             DeleteBufFromList(buf);
-            ereport(LOG, (errmsg("delete successfully buf_id = %d", buf->buf_id)));
+            //ereport(LOG, (errmsg("delete successfully buf_id = %d", buf->buf_id)));
         }
     }
     ((BufferDesc *)buf)->tag = new_tag;

@@ -242,7 +242,7 @@ typedef struct BufferDesc {
 } BufferDesc;
 
 #define LIST_CAPACITY 150000
-#define HOT_CAPACITY 50000
+#define HOT_CAPACITY 80000
 #define HISTORY_MAXLEN 50000
 #define HISTORY_LISTLEN (HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS)
 #define LEVEL_NUM 8
@@ -360,6 +360,7 @@ extern void DeleteBufFromList(BufferDesc *buf);
 extern void BufferAdmit(BufferDesc *buf);
 extern void HitBuffer(int buf_id);
 extern void InsertIntoColdList(BufferDesc *buf);
+extern void RefreshColdBuf(BufferDesc *buf);
 
 extern void StrategyFreeBuffer(volatile BufferDesc* buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc* buf);
