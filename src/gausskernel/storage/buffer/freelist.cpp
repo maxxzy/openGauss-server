@@ -75,6 +75,7 @@ typedef struct BufferStrategyControl {
     slock_t history_list_lock;
 
     int hot_size;
+    int hot_threshold;
     slock_t hot_list_lock;
 
     BufferDesc *cold_head;
@@ -85,6 +86,7 @@ typedef struct BufferStrategyControl {
     BufferDesc *tmp_tail;
 
     uint32 bottom;
+    uint32 top;
     uint32 history_capacity;
 
     bool in_compaction;
@@ -355,15 +357,14 @@ void compaction() {
     uint32 local_buf_state = 0;
     bool if_demote = false;
     auto Controller = t_thrd.storage_cxt.StrategyControl;
-    auto bottom = 0;
     int demote_cnt = 0;
     SpinLockAcquire(&Controller->hot_list_lock);
     Controller->tmp_head = NULL;
     Controller->tmp_tail = NULL;
 retry:
     buf = Controller->hot_head;
-    while(buf != NULL && demote_cnt < HOT_CAPACITY / 4) {
-
+    auto bottom = Controller->bottom;
+    while(buf != NULL) {
         next_buf = buf->next;
         if (buf->hitcount == bottom) {
             local_buf_state = LockBufHdr(buf);
@@ -387,8 +388,9 @@ retry:
         }
         buf = next_buf;
     }
-    if (!if_demote || demote_cnt < 5000) {
-        bottom = (bottom + 1) % LEVEL_NUM;
+    if (!if_demote) {
+        Controller->bottom = (bottom + 1) % LEVEL_NUM;
+        Controller->top = (Controller->top + 1) % LEVEL_NUM;
         goto retry;
     }
 
@@ -412,7 +414,7 @@ retry:
 
 bool check_compaction() {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
-    if (Controller->in_compaction || Controller->hot_size >= HOT_CAPACITY) {
+    if (Controller->in_compaction || Controller->hot_size >= Controller->hot_threshold) {
         return true;
     }
     return false;
@@ -455,11 +457,11 @@ void HitBuffer(int buf_id){
     local_buf_state = LockBufHdr(buf);
 
     if (buf->buftype == BufferType::Cold) {
-        if (Controller->cold_size < 1000) {
-            buf->hitcount++;
-            UnlockBufHdr(buf, local_buf_state);
-            return;
-        }
+        // if (Controller->cold_size < 1000) {
+        //     buf->hitcount++;
+        //     UnlockBufHdr(buf, local_buf_state);
+        //     return;
+        // }
         if (check_compaction()) {
             buf->hitcount++;
             UnlockBufHdr(buf, local_buf_state);
@@ -478,12 +480,18 @@ void HitBuffer(int buf_id){
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
 
             buf->buftype = BufferType::Hot;
-            buf->hitcount = (Controller->bottom + buf->hitcount - 1) % LEVEL_NUM;
+            if(buf->hitcount < LEVEL_NUM) {
+                buf->hitcount = (Controller->bottom + buf->hitcount - 1) % LEVEL_NUM;
+            } else {
+                buf->hitcount = Controller->top;
+            }
         }
         UnlockBufHdr(buf, local_buf_state);
         return;
     } else if (buf->buftype == BufferType::Hot) {
-        buf->hitcount = (buf->hitcount + 1) % LEVEL_NUM; //调试使用
+        if(buf->hitcount != Controller->top) {
+            buf->hitcount = (buf->hitcount + 1) % LEVEL_NUM; //调试使用
+        }
         UnlockBufHdr(buf, local_buf_state);
         return;
     } else {
@@ -520,7 +528,7 @@ void BufferAdmit(BufferDesc *buf) {
 
         ColdListPushBack(buf);
         buf->buftype = BufferType::Cold;
-        buf->hitcount = 1;
+        buf->hitcount = 0;
 
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
         return;
@@ -553,7 +561,11 @@ void BufferAdmit(BufferDesc *buf) {
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->hot_list_lock) ;
     HotListPushBack(buf);
     buf->buftype = BufferType::Hot;
-    buf->hitcount = (Controller->bottom + history_hitcount - 1) % LEVEL_NUM;
+    if(buf->hitcount < LEVEL_NUM) {
+        buf->hitcount = (Controller->bottom + history_hitcount - 1) % LEVEL_NUM;
+    } else {
+        buf->hitcount = Controller->top;
+    }
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
 }
 
@@ -589,7 +601,7 @@ void InsertIntoColdList(BufferDesc *buf){
     SpinLockAcquire(&Controller->cold_list_lock);
     ColdListPushBack(buf);
     buf->buftype = BufferType::Cold;
-    buf->hitcount = 1;
+    buf->hitcount = 0;
     SpinLockRelease(&Controller->cold_list_lock);
 }
 
@@ -1066,6 +1078,7 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->cold_size = 0;
         t_thrd.storage_cxt.StrategyControl->history_size = 0;
         t_thrd.storage_cxt.StrategyControl->hot_size = 0;
+        t_thrd.storage_cxt.StrategyControl->hot_threshold = (NORMAL_SHARED_BUFFER_NUM * 3) / 4;
 
         t_thrd.storage_cxt.StrategyControl->cold_head = NULL;
         t_thrd.storage_cxt.StrategyControl->hot_head = NULL;
@@ -1074,7 +1087,8 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->history_head = 0;
         t_thrd.storage_cxt.StrategyControl->history_tail = -1;
 
-        t_thrd.storage_cxt.StrategyControl->bottom = 1;
+        t_thrd.storage_cxt.StrategyControl->bottom = 0;
+        t_thrd.storage_cxt.StrategyControl->top = LEVEL_NUM - 1;
 
         t_thrd.storage_cxt.StrategyControl->if_get_from_free = false;
 

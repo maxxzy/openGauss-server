@@ -245,7 +245,7 @@ typedef struct BufferDesc {
 #define HOT_CAPACITY 80000
 #define HISTORY_MAXLEN 50000
 #define HISTORY_LISTLEN (HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS)
-#define LEVEL_NUM 8
+#define LEVEL_NUM 16
 /*
  * Concurrent access to buffer headers has proven to be more efficient if
  * they're cache line aligned. So we force the start of the BufferDescriptors
