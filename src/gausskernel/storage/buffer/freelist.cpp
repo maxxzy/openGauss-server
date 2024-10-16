@@ -31,6 +31,9 @@
 #include "pgstat.h"
 #include <unordered_map>
 #include <list>
+#include <cmath>
+#include <sstream>
+#include <string>
 #include "utils/dynahash.h"
 
 #define INT_ACCESS_ONCE(var) ((int)(*((volatile int *)&(var))))
@@ -64,6 +67,8 @@ typedef struct BufferStrategyControl {
 
     pg_atomic_uint32 firstVictimBuffer;
 
+    pg_atomic_uint64 requestTime;
+
     int cold_size;
     slock_t cold_list_lock;
 
@@ -92,6 +97,46 @@ typedef struct BufferStrategyControl {
     bool in_compaction;
     slock_t compaction_lock;
     bool if_get_from_free;
+
+    // Model Parameters
+    uint8_t n_feature;
+    uint32_t edc_windows[n_edc_feature];
+    double hash_edc[n_edc_feature];
+    uint32_t max_hash_edc_idx;
+    uint32_t memory_window;
+
+    // Train data collector
+    TrainData training_data;
+    slock_t data_lock;
+
+    // MetaData
+    // MetaData in_cache_meta[LIST_CAPACITY];
+    MetaData out_cache_meta[HISTORY_LISTLEN];
+
+    int evict_threshold;
+    // Model use
+    slock_t model_lock;
+    // BoosterHandle booster;
+    bool is_training;
+    bool is_trained;
+    const int num_candidate = 4;
+    BoosterHandle booster;
+    std::unordered_map<std::string, std::string> training_params = {
+        //don't use alias here. C api may not recognize
+        {"boosting",         "gbdt"},
+        {"objective",        "regression"},
+        {"num_iterations",   "32"},
+        {"num_leaves",       "32"},
+        {"num_threads",      "1"},
+        {"feature_fraction", "0.8"},
+        {"bagging_freq",     "5"},
+        {"bagging_fraction", "0.8"},
+        {"learning_rate",    "0.1"},
+        {"verbosity",        "0"},
+        {"force_row_wise", "true"},
+    };
+
+
 } BufferStrategyControl;
 
 typedef struct {
@@ -198,6 +243,193 @@ static inline uint32 ClockSweepTick(int max_nbuffer_can_use)
         }
     }
     return victim;
+}
+
+std::string map_to_string(std::unordered_map<std::string, std::string> &map) {
+    std::stringstream ss;
+    for (auto &it: map) {
+        ss << it.first << "=" << it.second << " ";
+    }
+    
+    return ss.str();
+}
+
+/**
+ * @description:通过积累的Training data对模型进行训练
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void ModelTrain() {
+    // create training dataset
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    int data_size = Controller->training_data.size_;
+    ereport(LOG, (errmsg("This batch data size is: %d", data_size)));
+    DatasetHandle trainData;
+    LGBM_DatasetCreateFromCSR(
+            static_cast<void *>(Controller->training_data.indptr),
+            C_API_DTYPE_INT32,
+            Controller->training_data.indices,
+            static_cast<void *>(Controller->training_data.data),
+            C_API_DTYPE_FLOAT64,
+            data_size + 1,
+            data_size * n_feature,
+            n_feature,  //remove future t
+            map_to_string(Controller->training_params).c_str(),
+            nullptr,
+            &trainData);
+
+    LGBM_DatasetSetField(trainData,
+                        "label",
+                        static_cast<void *>(Controller->training_data.labels),
+                        data_size,
+                        C_API_DTYPE_FLOAT32);
+
+    // init booster
+    SpinLockAcquire(&Controller->model_lock);
+    if (Controller->booster) LGBM_BoosterFree(Controller->booster);
+    LGBM_BoosterCreate(trainData, map_to_string(Controller->training_params).c_str(), &Controller->booster);
+    // train
+    for (int i = 0; i < std::stoi(Controller->training_params["num_iterations"]); i++) {
+        int isFinished;
+        LGBM_BoosterUpdateOneIter(Controller->booster, &isFinished);
+        // int64_t len;
+        // vector<double> result(training_data->indptr.size() - 1);
+        // LGBM_BoosterPredictForCSR(booster,
+        //                           static_cast<void *>(training_data->indptr.data()),
+        //                           C_API_DTYPE_INT32,
+        //                           training_data->indices.data(),
+        //                           static_cast<void *>(training_data->data.data()),
+        //                           C_API_DTYPE_FLOAT64,
+        //                           training_data->indptr.size(),
+        //                           training_data->data.size(),
+        //                           n_feature,  //remove future t
+        //                           C_API_PREDICT_NORMAL,
+        //                           0,
+        //                           atoi(training_params["num_iterations"].c_str()),
+        //                           map_to_string(training_params).c_str(),
+        //                           &len,
+        //                           result.data());
+
+
+        // double se = 0;
+        // for (int i = 0; i < result.size(); ++i) {
+        //     auto diff = result[i] - training_data->labels[i];
+        //     se += diff * diff;
+        // }
+        // cout << "The loss in iter " << i << " is: " << se << endl;
+        if (isFinished) {
+            break;
+        }
+    }
+    SpinLockRelease(&Controller->model_lock);
+
+    int64_t len;
+    double result[batch_size];
+    LGBM_BoosterPredictForCSR(Controller->booster,
+                                static_cast<void *>(Controller->training_data.indptr),
+                                C_API_DTYPE_INT32,
+                                Controller->training_data.indices,
+                                static_cast<void *>(Controller->training_data.data),
+                                C_API_DTYPE_FLOAT64,
+                                data_size + 1,
+                                data_size * n_feature,
+                                n_feature,  //remove future t
+                                C_API_PREDICT_NORMAL,
+                                0,
+                                std::atoi(Controller->training_params["num_iterations"].c_str()),
+                                map_to_string(Controller->training_params).c_str(),
+                                &len,
+                                result);
+
+    double se = 0;
+    int accurate_num = 0;
+    for (int i = 0; i < data_size; ++i) {
+        auto diff = result[i] - Controller->training_data.labels[i];
+        se += diff * diff;
+    }
+    //   cout << "The loss is: " << se << endl;
+    ereport(LOG,(errmsg("The loss in this round is: %f", se)));
+
+    //   loss_reg.emplace_back(se);
+
+    Controller->training_data.clear();
+
+    // training_loss = training_loss * 0.99 + se / batch_size * 0.01;
+
+    LGBM_DatasetFree(trainData);
+}
+
+/**
+ * @description:对给定的BufferDesc中的Metadata进行预测 判断是否为iCache中定义的热数据
+ * @return {是否为热数据 bool类型}
+ * @use:
+ * @author: zya
+ */
+extern bool ModelPredict(BufferDesc *buf) {
+    
+}
+
+
+
+void LogReportMetadata(BufferDesc *buf) {
+    // ereport(LOG, (errmsg("delete from list buf_id = %d, buf_buftype = %d", buf->buf_id, buf->buftype)));
+    ereport(LOG,(errmsg("Print Metadata Info:")));
+    ereport(LOG,(errmsg("Access time: %d",buf->meta.num_access)));
+    ereport(LOG,(errmsg("Last Access is: %lu", buf->meta.last_access)));
+    ereport(LOG,(errmsg("Distance array index is: %d", buf->meta.dis_idx)));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[0],buf->meta.past_distance[1],buf->meta.past_distance[2],buf->meta.past_distance[3],buf->meta.past_distance[4],buf->meta.past_distance[5],buf->meta.past_distance[6],buf->meta.past_distance[7])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[8],buf->meta.past_distance[9],buf->meta.past_distance[10],buf->meta.past_distance[11],buf->meta.past_distance[12],buf->meta.past_distance[13],buf->meta.past_distance[14],buf->meta.past_distance[15])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[16],buf->meta.past_distance[17],buf->meta.past_distance[18],buf->meta.past_distance[19],buf->meta.past_distance[20],buf->meta.past_distance[21],buf->meta.past_distance[22],buf->meta.past_distance[23])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[24],buf->meta.past_distance[25],buf->meta.past_distance[26],buf->meta.past_distance[27],buf->meta.past_distance[28],buf->meta.past_distance[29],buf->meta.past_distance[30],buf->meta.past_distance[31])));
+    ereport(LOG,(errmsg("Edc are: %f %f %f %f %f %f %f %f %f %f", buf->meta._edc[0],buf->meta._edc[1],buf->meta._edc[2],buf->meta._edc[3],buf->meta._edc[4],buf->meta._edc[5],buf->meta._edc[6],buf->meta._edc[7],buf->meta._edc[8],buf->meta._edc[9])));
+    ereport(LOG,(errmsg("Sample time is: %lu", buf->meta.sample_time)));
+
+    // ereport(WARNING,(errmsg("Print Metadata Info:")));
+    // ereport(WARNING,(errmsg("Access time: %d",buf->meta.num_access)));
+    // ereport(WARNING,(errmsg("Last Access is: %lu", buf->meta.last_access)));
+    // ereport(WARNING,(errmsg("Distance array index is: %d", buf->meta.dis_idx)));
+    // ereport(WARNING,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[0],buf->meta.past_distance[1],buf->meta.past_distance[2],buf->meta.past_distance[3],buf->meta.past_distance[4],buf->meta.past_distance[5],buf->meta.past_distance[6],buf->meta.past_distance[7])));
+    // ereport(WARNING,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[8],buf->meta.past_distance[9],buf->meta.past_distance[10],buf->meta.past_distance[11],buf->meta.past_distance[12],buf->meta.past_distance[13],buf->meta.past_distance[14],buf->meta.past_distance[15])));
+    // ereport(WARNING,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[16],buf->meta.past_distance[17],buf->meta.past_distance[18],buf->meta.past_distance[19],buf->meta.past_distance[20],buf->meta.past_distance[21],buf->meta.past_distance[22],buf->meta.past_distance[23])));
+    // ereport(WARNING,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[24],buf->meta.past_distance[25],buf->meta.past_distance[26],buf->meta.past_distance[27],buf->meta.past_distance[28],buf->meta.past_distance[29],buf->meta.past_distance[30],buf->meta.past_distance[31])));
+    // ereport(WARNING,(errmsg("Edc are: %f %f %f %f %f %f %f %f %f %f", buf->meta._edc[0],buf->meta._edc[1],buf->meta._edc[2],buf->meta._edc[3],buf->meta._edc[4],buf->meta._edc[5],buf->meta._edc[6],buf->meta._edc[7],buf->meta._edc[8],buf->meta._edc[9])));
+    // ereport(WARNING,(errmsg("Sample time: %d",buf->meta.sample_size)));
+    // ereport(WARNING,(errmsg("Sample index: %d", buf->meta.sample_idx)));
+    // ereport(WARNING,(errmsg("Sample time are: %lu %lu %lu %lu", buf->meta.sample_time[0],buf->meta.sample_time[1],buf->meta.sample_time[2],buf->meta.sample_time[3])));
+}
+
+/**
+ * @description:更新Buftag对应的特征信息
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void UpdateMeta(BufferDesc *buf, uint64_t access_time) {
+    // TODO: Decide whether lock the buf header
+    // if(access_time % 1000 == 0) {
+    //     ereport(WARNING,(errmsg("Before update")));
+    //     LogReportMetadata(buf);
+    // }
+    auto Controller = t_thrd.storage_cxt.StrategyControl;
+    buf->meta.update(access_time, Controller->max_hash_edc_idx, Controller->edc_windows, Controller->hash_edc);
+    buf->meta.erase_predict_mark();
+    // if(access_time % 1000 == 0) {
+    //     ereport(WARNING,(errmsg("After update")));
+    //     LogReportMetadata(buf);
+    // }
+}
+
+/**
+ * @description:对Buftag进行采样
+ * @return {*}
+ * @use:
+ * @author: zya
+ */
+void SampleBuffer(BufferDesc *buf, uint64_t access_time) {
+    // auto Controller = t_thrd.storage_cxt.StrategyControl;
+    buf->meta.update_sample(access_time);
+
 }
 
 int BufHistoryLookup(BufferTag *tag, uint32 hashcode)
@@ -382,6 +614,8 @@ retry:
             Controller->tmp_tail = buf;
             buf->buftype = BufferType::Cold;
             buf->hitcount = 1;
+            uint64 sample_time = pg_atomic_read_u64(&Controller->requestTime);
+            buf->meta.update_sample(sample_time);
             if_demote = true;
             demote_cnt++;
             UnlockBufHdr(buf, local_buf_state);
@@ -430,9 +664,29 @@ void CheckHistoryListSize() {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     while (Controller->history_size >= HISTORY_MAXLEN){
         BufferTag buf_tag = Controller->history_list[Controller->history_head];
+        if(!Controller->is_training) {
+        // TODO: Predict two-type classification
+            if(Controller->out_cache_meta[Controller->history_head].is_sampled) {
+                // revisit the sampled data block, add the metadata into train data
+                SpinLockAcquire(&Controller->data_lock);
+                Controller->training_data.emplace_back(Controller->out_cache_meta[Controller->history_head], Controller->out_cache_meta[Controller->history_head].sample_time, false, Controller->max_hash_edc_idx, Controller->edc_windows, Controller->hash_edc);
+                Controller->out_cache_meta[Controller->history_head].erase_sample_mark();
+                SpinLockRelease(&Controller->data_lock);
+                bool need_train = (Controller->training_data.size_ >= batch_size);
+                if() {
+                    // Train data is full and need train the model
+                    // TODO : Add train function
+                    ModelTrain();
+                    Controller->is_trained = true;
+                }
+            }
+        }
         uint32 hashcode = BufTableHashCode(&buf_tag);
         BufHistoryDelete(&buf_tag, hashcode);
         Controller->history_list[Controller->history_head] = {};
+        // ereport(LOG, (errmsg("Before null assign for out cache meta in check history size")));
+        Controller->out_cache_meta[Controller->history_head] = {};
+        // ereport(LOG, (errmsg("All out cache meta operation in check history size finished")));
         Controller->history_head = (Controller->history_head + 1) % HISTORY_LISTLEN;
         Controller->history_size--;
     }
@@ -448,13 +702,37 @@ void CheckHistoryListSize() {
  * @author: xzy
  */
 void HitBuffer(int buf_id){
+    // ereport(WARNING,(errmsg("Enter hit buffer")));
     BufferDesc *buf = NULL;
     BufferStrategyControl* Controller = t_thrd.storage_cxt.StrategyControl;
+    uint64_t access_time = pg_atomic_fetch_add_u64(&Controller->requestTime, 1);
 
     uint32 local_buf_state = 0;
     buf = GetBufferDescriptor(buf_id);
 
     local_buf_state = LockBufHdr(buf);
+
+    // deal with the sample data and insert into training data
+    if(!Controller->is_training) {
+        // TODO: Predict two-type classification
+        if(buf->meta.is_sampled) {
+            // revisit the sampled data block, add the metadata into train data
+            SpinLockAcquire(&Controller->data_lock);
+            Controller->training_data.emplace_back(buf->meta, buf->meta.sample_time, true, Controller->max_hash_edc_idx, Controller->edc_windows, Controller->hash_edc);
+            buf->meta.erase_sample_mark();
+            SpinLockRelease(&Controller->data_lock);
+            if(Controller->training_data.size_ >= batch_size) {
+                // Train data is full and need train the model
+                // TODO : Add train function
+                // TrainModel();
+                Controller->is_trained = true;
+            }
+        }
+    }
+    // Update the metadata of `buf`
+    // ereport(WARNING,(errmsg("Before update meta, and access time is: %lu", access_time)));
+    UpdateMeta(buf, access_time);
+    // ereport(WARNING,(errmsg("After update meta")));
 
     if (buf->buftype == BufferType::Cold) {
         // if (Controller->cold_size < 1000) {
@@ -517,7 +795,10 @@ void BufferAdmit(BufferDesc *buf) {
         ereport(WARNING, (errmsg("buffertype is not none when buffer admit, buf_id = %d", buf->buf_id)));
         return;
     }
+    // ereport(LOG, (errmsg("BufferAdmit, buf_id = %d, buf_tag, cpc = %d, db = %d, rel = %d, blockNum = %d, forkNum = %d",
+                        //  buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, buf->tag.blockNum, buf->tag.forkNum)));
     auto Controller = t_thrd.storage_cxt.StrategyControl;
+    uint64_t access_time = pg_atomic_fetch_add_u64(&Controller->requestTime, 1);
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     uint32 hashcode = BufTableHashCode(&buf->tag);
@@ -530,22 +811,53 @@ void BufferAdmit(BufferDesc *buf) {
         buf->buftype = BufferType::Cold;
         buf->hitcount = 0;
 
+        // ereport(LOG, (errmsg("Initialize meta in buffer descripter")));
+        buf->meta.init(access_time);
+        // ereport(LOG, (errmsg("Successfully initialize meta in buffer descripter")));
+
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        // ereport(LOG, (errmsg("Successfully Quit Buffer Admit1")));
         return;
     }
 
     auto list_index = HistoryIndexLookup(&buf->tag, hashcode);
     Controller->history_size--;
     Controller->history_list[list_index] = {};
+    buf->meta = Controller->out_cache_meta[list_index];
+    // ereport(LOG, (errmsg("Before out cache meta update, access time is: %lu", access_time)));
+    // deal with the sample data and insert into training data
+    if(!Controller->is_training) {
+        // TODO: Predict two-type classification
+        if(buf->meta.is_sampled) {
+            // revisit the sampled data block, add the metadata into train data
+            SpinLockAcquire(&Controller->data_lock);
+            Controller->training_data.emplace_back(buf->meta, buf->meta.sample_time, true, Controller->max_hash_edc_idx, Controller->edc_windows, Controller->hash_edc);
+            buf->meta.erase_sample_mark();
+            SpinLockRelease(&Controller->data_lock);
+            if(Controller->training_data.size_ >= batch_size) {
+                // Train data is full and need train the model
+                // TODO : Add train function
+                // TrainModel();
+                Controller->is_trained = true;
+            }
+        }
+    }
+    UpdateMeta(buf, access_time);
+    // ereport(LOG, (errmsg("After update cache")));
+    // ereport(LOG, (errmsg("After meta assignment")));
     BufHistoryDelete(&buf->tag, hashcode);
     int i = list_index;
     while (i != Controller->history_tail) {
         uint32 current_hash = BufTableHashCode(&Controller->history_list[(i + 1) % HISTORY_LISTLEN]);
         UpdateHistoryIndex(&Controller->history_list[(i + 1) % HISTORY_LISTLEN], current_hash, i);
         Controller->history_list[i] = Controller->history_list[(i + 1) % HISTORY_LISTLEN];
+        Controller->out_cache_meta[i] = Controller->out_cache_meta[(i + 1) % HISTORY_LISTLEN];
         i = (i + 1) % HISTORY_LISTLEN;
     }
     Controller->history_list[i] = {};
+    // ereport(LOG, (errmsg("Before last assignment for out cache meta in admit")));
+    Controller->out_cache_meta[i] = {};
+    // ereport(LOG, (errmsg("All out cache meta operation in admit finished")));
     PrevIndex(&Controller->history_tail, HISTORY_LISTLEN);
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
 
@@ -555,6 +867,7 @@ void BufferAdmit(BufferDesc *buf) {
         buf->buftype = BufferType::Cold;
         buf->hitcount = history_hitcount + 1;
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+        // ereport(LOG, (errmsg("Successfully Quit Buffer Admit2")));
         return;
     }
 
@@ -567,6 +880,7 @@ void BufferAdmit(BufferDesc *buf) {
         buf->hitcount = Controller->top;
     }
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+    // ereport(LOG, (errmsg("Successfully Quit Buffer Admit3")));
 }
 
 void DeleteBufFromList(BufferDesc *buf) {
@@ -580,10 +894,39 @@ void DeleteBufFromList(BufferDesc *buf) {
         HotListDeleteBuf(buf);
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
     }
-
+    // uint64 evict_time = pg_atomic_read_u64(&Controller->requestTime);
+    // buf->meta.update_evict(evict_time);
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     Controller->history_tail = (Controller->history_tail + 1) % HISTORY_LISTLEN;
     Controller->history_list[Controller->history_tail] = buf->tag;
+    ereport(LOG, (errmsg("Before assignment for meta in delete")));
+    Controller->out_cache_meta[Controller->history_tail] = buf->meta;
+    ereport(LOG, (errmsg("Print Old Metadata Info: ")));
+    ereport(LOG,(errmsg("Print Metadata Info:")));
+    ereport(LOG,(errmsg("Access time: %d",buf->meta.num_access)));
+    ereport(LOG,(errmsg("Last Access is: %lu", buf->meta.last_access)));
+    ereport(LOG,(errmsg("Distance array index is: %d", buf->meta.dis_idx)));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[0],buf->meta.past_distance[1],buf->meta.past_distance[2],buf->meta.past_distance[3],buf->meta.past_distance[4],buf->meta.past_distance[5],buf->meta.past_distance[6],buf->meta.past_distance[7])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[8],buf->meta.past_distance[9],buf->meta.past_distance[10],buf->meta.past_distance[11],buf->meta.past_distance[12],buf->meta.past_distance[13],buf->meta.past_distance[14],buf->meta.past_distance[15])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[16],buf->meta.past_distance[17],buf->meta.past_distance[18],buf->meta.past_distance[19],buf->meta.past_distance[20],buf->meta.past_distance[21],buf->meta.past_distance[22],buf->meta.past_distance[23])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",buf->meta.past_distance[24],buf->meta.past_distance[25],buf->meta.past_distance[26],buf->meta.past_distance[27],buf->meta.past_distance[28],buf->meta.past_distance[29],buf->meta.past_distance[30],buf->meta.past_distance[31])));
+    ereport(LOG,(errmsg("Edc are: %f %f %f %f %f %f %f %f %f %f", buf->meta._edc[0],buf->meta._edc[1],buf->meta._edc[2],buf->meta._edc[3],buf->meta._edc[4],buf->meta._edc[5],buf->meta._edc[6],buf->meta._edc[7],buf->meta._edc[8],buf->meta._edc[9])));
+    ereport(LOG,(errmsg("Sample time: %d",buf->meta.sample_size)));
+    ereport(LOG,(errmsg("Sample index: %d", buf->meta.sample_idx)));
+    ereport(LOG,(errmsg("Sample time are: %lu %lu %lu %lu", buf->meta.sample_time[0],buf->meta.sample_time[1],buf->meta.sample_time[2],buf->meta.sample_time[3])));
+    ereport(LOG,(errmsg("Print New Metadata Info:")));
+    ereport(LOG,(errmsg("Access time: %d",Controller->out_cache_meta[Controller->history_tail].num_access)));
+    ereport(LOG,(errmsg("Last Access is: %lu", Controller->out_cache_meta[Controller->history_tail].last_access)));
+    ereport(LOG,(errmsg("Distance array index is: %d", Controller->out_cache_meta[Controller->history_tail].dis_idx)));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",Controller->out_cache_meta[Controller->history_tail].past_distance[0],Controller->out_cache_meta[Controller->history_tail].past_distance[1],Controller->out_cache_meta[Controller->history_tail].past_distance[2],Controller->out_cache_meta[Controller->history_tail].past_distance[3],Controller->out_cache_meta[Controller->history_tail].past_distance[4],Controller->out_cache_meta[Controller->history_tail].past_distance[5],Controller->out_cache_meta[Controller->history_tail].past_distance[6],Controller->out_cache_meta[Controller->history_tail].past_distance[7])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",Controller->out_cache_meta[Controller->history_tail].past_distance[8],Controller->out_cache_meta[Controller->history_tail].past_distance[9],Controller->out_cache_meta[Controller->history_tail].past_distance[10],Controller->out_cache_meta[Controller->history_tail].past_distance[11],Controller->out_cache_meta[Controller->history_tail].past_distance[12],Controller->out_cache_meta[Controller->history_tail].past_distance[13],Controller->out_cache_meta[Controller->history_tail].past_distance[14],Controller->out_cache_meta[Controller->history_tail].past_distance[15])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",Controller->out_cache_meta[Controller->history_tail].past_distance[16],Controller->out_cache_meta[Controller->history_tail].past_distance[17],Controller->out_cache_meta[Controller->history_tail].past_distance[18],Controller->out_cache_meta[Controller->history_tail].past_distance[19],Controller->out_cache_meta[Controller->history_tail].past_distance[20],Controller->out_cache_meta[Controller->history_tail].past_distance[21],Controller->out_cache_meta[Controller->history_tail].past_distance[22],Controller->out_cache_meta[Controller->history_tail].past_distance[23])));
+    ereport(LOG,(errmsg("Distance are: %lu %lu %lu %lu %lu %lu %lu %lu",Controller->out_cache_meta[Controller->history_tail].past_distance[24],Controller->out_cache_meta[Controller->history_tail].past_distance[25],Controller->out_cache_meta[Controller->history_tail].past_distance[26],Controller->out_cache_meta[Controller->history_tail].past_distance[27],Controller->out_cache_meta[Controller->history_tail].past_distance[28],Controller->out_cache_meta[Controller->history_tail].past_distance[29],Controller->out_cache_meta[Controller->history_tail].past_distance[30],Controller->out_cache_meta[Controller->history_tail].past_distance[31])));
+    ereport(LOG,(errmsg("Edc are: %f %f %f %f %f %f %f %f %f %f", Controller->out_cache_meta[Controller->history_tail]._edc[0],Controller->out_cache_meta[Controller->history_tail]._edc[1],Controller->out_cache_meta[Controller->history_tail]._edc[2],Controller->out_cache_meta[Controller->history_tail]._edc[3],Controller->out_cache_meta[Controller->history_tail]._edc[4],Controller->out_cache_meta[Controller->history_tail]._edc[5],Controller->out_cache_meta[Controller->history_tail]._edc[6],Controller->out_cache_meta[Controller->history_tail]._edc[7],Controller->out_cache_meta[Controller->history_tail]._edc[8],Controller->out_cache_meta[Controller->history_tail]._edc[9])));
+    ereport(LOG,(errmsg("Sample time: %d",Controller->out_cache_meta[Controller->history_tail].sample_size)));
+    ereport(LOG,(errmsg("Sample index: %d", Controller->out_cache_meta[Controller->history_tail].sample_idx)));
+    ereport(LOG,(errmsg("Sample time are: %lu %lu %lu %lu", Controller->out_cache_meta[Controller->history_tail].sample_time[0],Controller->out_cache_meta[Controller->history_tail].sample_time[1],Controller->out_cache_meta[Controller->history_tail].sample_time[2],Controller->out_cache_meta[Controller->history_tail].sample_time[3])));
+    ereport(LOG, (errmsg("All out cache meta operation in delete finished")));
     Controller->history_size++;
     uint32 hashcode = BufTableHashCode(&buf->tag);
     if (BufHistoryInsert(&buf->tag, hashcode, buf->hitcount, Controller->history_tail) != -1) {
@@ -1072,6 +1415,8 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->completePasses = 0;
         pg_atomic_init_u32(&t_thrd.storage_cxt.StrategyControl->numBufferAllocs, 0);
 
+        pg_atomic_init_u64(&t_thrd.storage_cxt.StrategyControl->requestTime, 0);
+
         /* No pending notification */
         t_thrd.storage_cxt.StrategyControl->bgwprocno = -1;
 
@@ -1090,8 +1435,26 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->bottom = 0;
         t_thrd.storage_cxt.StrategyControl->top = LEVEL_NUM - 1;
 
+        t_thrd.storage_cxt.StrategyControl->booster = nullptr;
+        t_thrd.storage_cxt.StrategyControl->is_trained = false;
+        t_thrd.storage_cxt.StrategyControl->is_training = false;
+        t_thrd.storage_cxt.StrategyControl->evict_threshold = 128;
+
         t_thrd.storage_cxt.StrategyControl->if_get_from_free = false;
 
+        double tmp_edc = 1.0;
+        for(int i = 0; i < n_edc_feature; i++) {
+            t_thrd.storage_cxt.StrategyControl->hash_edc[i] = tmp_edc;
+            tmp_edc = tmp_edc * 0.5;
+        }
+
+        for (uint8_t i = 0; i < n_edc_feature; ++i) {
+            t_thrd.storage_cxt.StrategyControl->edc_windows[i] = pow(2, base_edc_window + i);
+        }
+        t_thrd.storage_cxt.StrategyControl->n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+        t_thrd.storage_cxt.StrategyControl->memory_window = 67108864;
+        t_thrd.storage_cxt.StrategyControl->max_hash_edc_idx = 9;
+        
         for (int i = 0; i < TOTAL_BUFFER_NUM; i++) {
             BufferDesc *buf = GetBufferDescriptor(i);
             buf->buftype = BufferType::NONE;
@@ -1099,6 +1462,7 @@ void StrategyInitialize(bool init)
             buf->next = NULL;
             buf->prev = NULL;
             buf->first_get_from_free = true;
+            buf->meta.default_initialize();
         }
 
         HASHCTL info;
@@ -1109,6 +1473,7 @@ void StrategyInitialize(bool init)
         int size = HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS;
         t_thrd.storage_cxt.StrategyControl->history_hitcount_map = ShmemInitHash("Buffer history table", size, size, &info,
                                                      HASH_ELEM | HASH_FUNCTION | HASH_PARTITION);
+        ereport(WARNING, (errmsg("Successfully Strategy init")));
     } else {
         Assert(!init);
     }
