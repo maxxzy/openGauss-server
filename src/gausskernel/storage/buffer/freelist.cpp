@@ -519,6 +519,15 @@ void BufferAdmit(BufferDesc *buf) {
     }
     auto Controller = t_thrd.storage_cxt.StrategyControl;
 
+    SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+
+    ColdListPushBack(buf);
+    buf->buftype = BufferType::Cold;
+    buf->hitcount = 0;
+
+    SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
+    return;
+/*
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     uint32 hashcode = BufTableHashCode(&buf->tag);
     int history_hitcount = BufHistoryLookup(&buf->tag, hashcode);
@@ -567,6 +576,7 @@ void BufferAdmit(BufferDesc *buf) {
         buf->hitcount = Controller->top;
     }
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
+*/
 }
 
 void DeleteBufFromList(BufferDesc *buf) {
@@ -581,6 +591,7 @@ void DeleteBufFromList(BufferDesc *buf) {
         SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->hot_list_lock);
     }
 
+/*
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
     Controller->history_tail = (Controller->history_tail + 1) % HISTORY_LISTLEN;
     Controller->history_list[Controller->history_tail] = buf->tag;
@@ -591,6 +602,7 @@ void DeleteBufFromList(BufferDesc *buf) {
     }
     CheckHistoryListSize();
     SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->history_list_lock);
+*/
 
     buf->buftype = BufferType::NONE;
     buf->hitcount = 0;
@@ -746,6 +758,14 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         }
 
         retry_lock_status.retry_times = 0;
+
+/*
+        if (local_buf_state & BM_DIRTY) {
+            buf = buf->next;
+            continue;
+        }
+*/
+
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
 
