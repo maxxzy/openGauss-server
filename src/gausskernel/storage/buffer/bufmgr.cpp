@@ -2786,7 +2786,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         if (!SSHelpFlushBufferIfNeed(buf)) {
             // for dms this page cannot eliminate, get another one 
             UnpinBuffer(buf, true);
-            if (buf->buftype == BufferType::Cold) {
+            if (buf->buftype == BufferType::Cold || buf->buftype == BufferType::AddToRing) {
                 RefreshColdBuf(buf);
             } else if (buf->buftype == BufferType::NONE) {
                 buf->first_get_from_free = true;
@@ -2807,7 +2807,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
             if (!backend_can_flush_dirty_page()) {
                 UnpinBuffer(buf, true);
                 (void)sched_yield();
-                if (buf->buftype == BufferType::Cold) {
+                if (buf->buftype == BufferType::Cold || buf->buftype == BufferType::AddToRing) {
                     RefreshColdBuf(buf);
                 } else if (buf->buftype == BufferType::NONE) {
                     buf->first_get_from_free = true;
@@ -2857,7 +2857,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
                         /* Drop lock/pin and loop around for another buffer */
                         LWLockRelease(buf->content_lock);
                         UnpinBuffer(buf, true);
-                        if (buf->buftype == BufferType::Cold) {
+                        if (buf->buftype == BufferType::Cold || buf->buftype == BufferType::AddToRing) {
                             RefreshColdBuf(buf);
                         } else if (buf->buftype == BufferType::NONE) {
                             buf->first_get_from_free = true;
@@ -2875,7 +2875,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
                     if (!free_space_enough(buf->buf_id)) {
                         LWLockRelease(buf->content_lock);
                         UnpinBuffer(buf, true);
-                        if (buf->buftype == BufferType::Cold) {
+                        if (buf->buftype == BufferType::Cold || buf->buftype == BufferType::AddToRing) {
                             RefreshColdBuf(buf);
                         } else if (buf->buftype == BufferType::NONE) {
                             buf->first_get_from_free = true;
@@ -3021,7 +3021,7 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumbe
         }
         LWLockRelease(new_partition_lock);
         UnpinBuffer(buf, true);
-        if (buf->buftype == BufferType::Cold) {
+        if (buf->buftype == BufferType::Cold || buf->buftype == BufferType::AddToRing) {
             RefreshColdBuf(buf);
         } else if (buf->buftype == BufferType::NONE) {
             buf->first_get_from_free = true;

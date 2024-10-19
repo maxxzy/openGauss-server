@@ -367,6 +367,7 @@ void compaction() {
     bool if_demote = false;
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     int demote_cnt = 0;
+    ereport(LOG, (errmsg("start compaction hot size = %d", Controller->hot_size)));
     SpinLockAcquire(&Controller->hot_list_lock);
     Controller->tmp_head = NULL;
     Controller->tmp_tail = NULL;
@@ -419,6 +420,7 @@ retry:
 
     SpinLockRelease(&Controller->hot_list_lock);
     Controller->in_compaction = false;
+    ereport(LOG, (errmsg("compaction complete, demote_cnt = %d, hot_size = %d", demote_cnt, Controller->hot_size)));
 }
 
 bool check_compaction() {
@@ -735,15 +737,6 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             continue;
         }
 
-        retry_lock_status.retry_times = 0;
-
-/*
-        if (local_buf_state & BM_DIRTY) {
-            buf = buf->next;
-            continue;
-        }
-*/
-
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
             (backend_can_flush_dirty_page() || !(local_buf_state & BM_DIRTY))) {
 
@@ -1031,7 +1024,8 @@ Size StrategyShmemSize(void)
  */
 void StrategyInitialize(bool init)
 {
-    ereport(WARNING, (errmsg("--------------------------StrategyInitialize, buffer_num = %d", TOTAL_BUFFER_NUM)));
+    ereport(WARNING, (errmsg("--------------------------StrategyInitialize, dirty page %f",
+                            g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers))));
     bool found = false;
 
     /*
@@ -1076,8 +1070,8 @@ void StrategyInitialize(bool init)
         t_thrd.storage_cxt.StrategyControl->cold_size = 0;
         t_thrd.storage_cxt.StrategyControl->history_size = 0;
         t_thrd.storage_cxt.StrategyControl->hot_size = 0;
-        //t_thrd.storage_cxt.StrategyControl->hot_threshold = (NORMAL_SHARED_BUFFER_NUM * 3) / 4;
-        t_thrd.storage_cxt.StrategyControl->hot_threshold = 1000;
+        t_thrd.storage_cxt.StrategyControl->hot_threshold = (NORMAL_SHARED_BUFFER_NUM * 3) / 4;
+        //t_thrd.storage_cxt.StrategyControl->hot_threshold = 1000;
 
         t_thrd.storage_cxt.StrategyControl->cold_head = NULL;
         t_thrd.storage_cxt.StrategyControl->hot_head = NULL;
