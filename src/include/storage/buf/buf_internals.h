@@ -117,9 +117,16 @@ typedef struct {
     int id;        /* Associated buffer ID */
 } BufferLookupEnt;
 
+typedef struct HistoryData{
+    BufferTag tag;
+    HistoryData* next;
+    HistoryData* prev;
+    HistoryData(BufferTag tag, HistoryData* next, HistoryData* prev) : tag(tag), next(next), prev(prev) {}
+} HistoryData;
+
 typedef struct {
     BufferTag key;
-    int index;
+    HistoryData* historyData;
     int hitcount;
 } BufHistoryHitcount;
 
@@ -243,7 +250,7 @@ typedef struct BufferDesc {
 
 #define LIST_CAPACITY 150000
 #define HOT_CAPACITY 80000
-#define HISTORY_MAXLEN 50000
+#define HISTORY_MAXLEN 10000
 #define HISTORY_LISTLEN (HISTORY_MAXLEN + NUM_BUFFER_PARTITIONS)
 #define LEVEL_NUM 8
 /*
@@ -378,10 +385,10 @@ extern uint32 BufTableHashCode(BufferTag* tagPtr);
 extern int BufTableLookup(BufferTag* tagPtr, uint32 hashcode);
 extern int BufTableInsert(BufferTag* tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag* tagPtr, uint32 hashcode);
-extern int BufHistoryLookup(BufferTag* tagPtr, uint32 hashcode);
-extern int BufHistoryInsert(BufferTag* tagPtr, uint32 hashcode, int hitcount, int index);
 extern void BufHistoryDelete(BufferTag* tagPtr, uint32 hashcode);
-extern int HistoryIndexLookup(BufferTag *tag, uint32 hashcode);
+extern BufHistoryHitcount* BufHistoryLookup(BufferTag* tagPtr, uint32 hashcode);
+extern int BufHistoryInsert(BufferTag* tagPtr, uint32 hashcode, int hitcount, HistoryData* history);
+extern HistoryData* HistoryDataLookup(BufferTag *tag, uint32 hashcode);
 
 /* localbuf.c */
 extern void LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum);
