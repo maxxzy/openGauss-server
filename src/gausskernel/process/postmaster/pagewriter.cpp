@@ -1401,7 +1401,7 @@ static void ckpt_pagewriter_sub_thread_loop()
         /* scan buffer pool, get flush list and candidate list */
         now = get_time_ms();
         if (t_thrd.pagewriter_cxt.next_scan_time <= now) {
-            ereport(LOG, (errmsg("pagewriter thread scan buffer pool, sleep = %d ms", MAX(u_sess->attr.attr_storage.BgWriterDelay, u_sess->attr.attr_storage.pageWriterSleep))));
+            //ereport(LOG, (errmsg("pagewriter thread scan buffer pool, sleep = %d ms", MAX(u_sess->attr.attr_storage.BgWriterDelay, u_sess->attr.attr_storage.pageWriterSleep))));
             incre_ckpt_pgwr_scan_buf_pool(&wb_context);
             now = get_time_ms();
             t_thrd.pagewriter_cxt.next_scan_time = now +

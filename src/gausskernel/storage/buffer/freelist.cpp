@@ -367,7 +367,6 @@ void compaction() {
     bool if_demote = false;
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     int demote_cnt = 0;
-    ereport(LOG, (errmsg("start compaction hot size = %d", Controller->hot_size)));
     SpinLockAcquire(&Controller->hot_list_lock);
     Controller->tmp_head = NULL;
     Controller->tmp_tail = NULL;
@@ -420,7 +419,6 @@ retry:
 
     SpinLockRelease(&Controller->hot_list_lock);
     Controller->in_compaction = false;
-    ereport(LOG, (errmsg("compaction complete, demote_cnt = %d, hot_size = %d", demote_cnt, Controller->hot_size)));
 }
 
 bool check_compaction() {
@@ -485,7 +483,7 @@ void HitBuffer(int buf_id){
 
             buf->buftype = BufferType::Hot;
             if(buf->hitcount < LEVEL_NUM) {
-                buf->hitcount = (Controller->bottom + buf->hitcount - 1) % LEVEL_NUM;
+                buf->hitcount = (Controller->bottom + buf->hitcount) % LEVEL_NUM;
             } else {
                 buf->hitcount = Controller->top;
             }
@@ -555,7 +553,7 @@ void BufferAdmit(BufferDesc *buf) {
     HotListPushBack(buf);
     buf->buftype = BufferType::Hot;
     if(buf->hitcount < LEVEL_NUM) {
-        buf->hitcount = (Controller->bottom + history->hitcount - 1) % LEVEL_NUM;
+        buf->hitcount = (Controller->bottom + history->hitcount) % LEVEL_NUM;
     } else {
         buf->hitcount = Controller->top;
     }
@@ -601,9 +599,12 @@ void RefreshColdBuf(BufferDesc *buf) {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     uint32 local_buf_state = LockBufHdr(buf);
     SpinLockAcquire(&Controller->cold_list_lock);
-    ColdListDeleteBuf(buf);
+    if (buf->buftype == BufferType::Cold) {
+        ColdListDeleteBuf(buf);
+    }
     ColdListPushBack(buf);
     SpinLockRelease(&Controller->cold_list_lock);
+    buf->buftype = BufferType::Cold;
     UnlockBufHdr(buf, local_buf_state);
 }
 
@@ -1024,8 +1025,10 @@ Size StrategyShmemSize(void)
  */
 void StrategyInitialize(bool init)
 {
+    /*
     ereport(WARNING, (errmsg("--------------------------StrategyInitialize, dirty page %f",
                             g_instance.ckpt_cxt_ctl->actual_dirty_page_num / (float)(g_instance.attr.attr_storage.NBuffers))));
+    */
     bool found = false;
 
     /*
