@@ -406,7 +406,7 @@ void compaction() {
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     auto bottom = 0;
     int demote_cnt = 0;
-    ereport(LOG, (errmsg("start compaction hot size = %d", Controller->hot_size)));
+    //ereport(LOG, (errmsg("start compaction hot size = %d", Controller->hot_size)));
     SpinLockAcquire(&Controller->hot_list_lock);
     //ereport(LOG, (errmsg("hot list lock get !!!!")));
     //ereport(LOG, (errmsg("cold list lock get !!!!")));
@@ -479,7 +479,7 @@ retry:
 
     SpinLockRelease(&Controller->hot_list_lock);
     Controller->in_compaction = false;
-    ereport(LOG, (errmsg("compaction complete, demote_cnt = %d, hot_size = %d", demote_cnt, Controller->hot_size)));
+    //ereport(LOG, (errmsg("compaction complete, demote_cnt = %d, hot_size = %d", demote_cnt, Controller->hot_size)));
 }
 
 bool check_compaction() {
@@ -679,9 +679,12 @@ void RefreshColdBuf(BufferDesc *buf) {
     //ereport(LOG, (errmsg("Push again buf_id = %d", buf->buf_id)));
     uint32 local_buf_state = LockBufHdr(buf);
     SpinLockAcquire(&Controller->cold_list_lock);
-    ColdListDeleteBuf(buf);
+    if (buf->buftype == BufferType::Cold) {
+        ColdListDeleteBuf(buf);
+    }
     ColdListPushBack(buf);
     SpinLockRelease(&Controller->cold_list_lock);
+    buf->buftype = BufferType::Cold;
     UnlockBufHdr(buf, local_buf_state);
 }
 
@@ -714,7 +717,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         buf = GetBufferFromRing(strategy, buf_state);
         //ereport(LOG, (errmsg("RingBuffer???")));
         if (buf != NULL) {
-            ereport(LOG, (errmsg("return buffer from ring, buf_id = %d, buf_type = %d", buf->buf_id, buf->buf_id)));
+            //ereport(LOG, (errmsg("return buffer from ring, buf_id = %d, buf_type = %d", buf->buf_id, buf->buf_id)));
             return buf;
         }
     }
@@ -770,7 +773,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
                 if (buf != NULL) {
                     buf->first_get_from_free = false;
                     (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
-                    ereport(LOG, (errmsg("get buffer from freelist buf_id = %d", buf->buf_id)));
+                    //ereport(LOG, (errmsg("get buffer from freelist buf_id = %d", buf->buf_id)));
                     t_thrd.storage_cxt.StrategyControl->if_get_from_free = true;
                     return buf;
                 }
@@ -789,7 +792,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
             if (buf != NULL) {
                 buf->first_get_from_free = false;
                 (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->get_buf_num_candidate_list, 1);
-                ereport(LOG, (errmsg("get buffer from freelist buf_id = %d", buf->buf_id)));
+                //ereport(LOG, (errmsg("get buffer from freelist buf_id = %d", buf->buf_id)));
                 t_thrd.storage_cxt.StrategyControl->if_get_from_free = true;
                 return buf;
             }
@@ -800,7 +803,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
     auto Controller = t_thrd.storage_cxt.StrategyControl;
     int buf_id = pg_atomic_read_u32(&Controller->firstVictimBuffer);
     if (buf_id < NORMAL_SHARED_BUFFER_NUM && !Controller->if_get_from_free) {
-        ereport(LOG, (errmsg("get next victim buffer without algorithm, buf_id = %d", buf_id)));
+        //ereport(LOG, (errmsg("get next victim buffer without algorithm, buf_id = %d", buf_id)));
         buf = GetBufferDescriptor(buf_id);
         local_buf_state = LockBufHdr(buf);
         if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 && !(local_buf_state & BM_IS_META) &&
@@ -819,7 +822,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
     //int try_get_lock_times = 3;
 
     SpinLockAcquire(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
-    ereport(LOG, (errmsg("run icache algorithm, coldlist size %d", Controller->cold_size)));
+    //ereport(LOG, (errmsg("run icache algorithm, coldlist size %d", Controller->cold_size)));
     //ereport(LOG, (errmsg("cold list lock get !!!!")));
 
     buf = Controller->cold_head;
@@ -834,7 +837,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         }
 
         if (buf->buftype != BufferType::Cold) {
-            ereport(WARNING, (errmsg("this buf is not cold!!!!!")));
+            //ereport(WARNING, (errmsg("this buf is not cold!!!!!")));
             UnlockBufHdr(buf, local_buf_state);
             buf = Controller->cold_head;
             continue;
@@ -857,7 +860,7 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
         } else if (--try_counter == 0) {
             UnlockBufHdr(buf, local_buf_state);
             SpinLockRelease(&t_thrd.storage_cxt.StrategyControl->cold_list_lock);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("no unpinned buffers available"))));
+            //ereport(ERROR, (errcode(ERRCODE_INVALID_BUFFER), (errmsg("no unpinned buffers available"))));
         }
         UnlockBufHdr(buf, local_buf_state);
         //perform_delay(&retry_buf_status);
@@ -890,7 +893,6 @@ BufferDesc* StrategyGetBuffer_new(BufferAccessStrategy strategy, uint32* buf_sta
  */
 BufferDesc* StrategyGetBuffer(BufferAccessStrategy strategy, uint32* buf_state)
 {
-    ereport(LOG, (errmsg("old_StrategyGetBuffer!!!!!")));
     BufferDesc *buf = NULL;
     int bgwproc_no;
     int try_counter;
@@ -1131,7 +1133,7 @@ Size StrategyShmemSize(void)
  */
 void StrategyInitialize(bool init)
 {
-    ereport(WARNING, (errmsg("--------------------------StrategyInitialize, buffer_num = %d", TOTAL_BUFFER_NUM)));
+    //ereport(WARNING, (errmsg("--------------------------StrategyInitialize, buffer_num = %d", TOTAL_BUFFER_NUM)));
     bool found = false;
 
     /*
